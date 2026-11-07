@@ -8,6 +8,21 @@ ever deleted automatically.
 Data lives in `~/Library/Application Support/Safety Disk Cleaner/cleaner.db`
 (the same database the earlier Go version used, so settings carry over).
 
+![Overview](docs/screenshots/overview.png)
+
+![Disk activity](docs/screenshots/disk-activity.png)
+
+More screens: [files to review](docs/screenshots/files.png) · [volumes](docs/screenshots/volumes.png) ·
+[history](docs/screenshots/history.png) · [settings](docs/screenshots/settings.png).
+Screenshots use the fake-file sandbox described below.
+
+## Install
+
+Download the DMG or zip from the [latest release](https://github.com/quan-vu/SafeDiskCleaner/releases/latest)
+(Apple silicon, macOS 13+). The build is ad-hoc signed, not notarized: on first launch,
+right-click the app and choose **Open**, or run
+`xattr -dr com.apple.quarantine "/Applications/Safety Disk Cleaner.app"`.
+
 ## Layout
 
 | Path | What |
