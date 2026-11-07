@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: |
@@ -41,7 +41,7 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           ditto -c -k --keepParent "dist/Safety Disk Cleaner.app" "dist/SafeDiskCleaner-$VERSION-macos-arm64.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SafeDiskCleaner-${{ env.VERSION }}-macos-arm64
           path: |
@@ -50,7 +50,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.zip
