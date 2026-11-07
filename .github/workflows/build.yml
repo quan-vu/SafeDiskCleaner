@@ -14,7 +14,7 @@ concurrency:
 jobs:
   build:
     name: Test, lint and bundle (macOS arm64)
-    runs-on: macos-14
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:
