@@ -21,7 +21,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/target/$PROFILE/safety-disk-cleaner" "$APP/Contents/MacOS/"
 sed "s/__VERSION__/$VERSION/g" bundle/Info.plist > "$APP/Contents/Info.plist"
 
-ICON_SRC="$ROOT/../resources/icon.png"
+ICON_SRC="$ROOT/resources/icon.png"
 if [[ -f $ICON_SRC ]]; then
   SET=$(mktemp -d)/AppIcon.iconset
   mkdir -p "$SET"

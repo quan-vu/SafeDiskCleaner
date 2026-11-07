@@ -1,7 +1,7 @@
-.mygo/
-build/
+target/
 dist/
+dev-sandbox/
+.DS_Store
 *.db
 *.db-shm
 *.db-wal
-resources/trash-helper

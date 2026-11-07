@@ -120,6 +120,10 @@ pub struct App {
     pub draft_text: RefCell<Option<[String; 5]>>,
     pub setup_home: Cell<bool>,
     render_pending: Cell<bool>,
+    /// User collapsed the sidebar with the toolbar toggle.
+    pub sidebar_collapsed: Cell<bool>,
+    /// (main after sidebar, main at window edge) leading constraints.
+    pub main_leading: RefCell<Option<(Retained<NSLayoutConstraint>, Retained<NSLayoutConstraint>)>>,
 }
 
 pub struct ScanOutcome {
@@ -169,6 +173,8 @@ impl App {
             draft_text: RefCell::new(None),
             setup_home: Cell::new(false),
             render_pending: Cell::new(false),
+            sidebar_collapsed: Cell::new(false),
+            main_leading: RefCell::new(None),
         });
         APP.with(|cell| {
             let _ = cell.set(a.clone());
@@ -222,6 +228,11 @@ impl App {
             item.title.setTextColor(Some(&*if on { NSColor::whiteColor() } else { Palette::primary() }));
             item.metric.setTextColor(Some(&*if on { NSColor::whiteColor() } else { item.metric_color.clone() }));
         }
+        self.request_render();
+    }
+
+    pub fn toggle_sidebar(&self) {
+        self.sidebar_collapsed.set(!self.sidebar_collapsed.get());
         self.request_render();
     }
 

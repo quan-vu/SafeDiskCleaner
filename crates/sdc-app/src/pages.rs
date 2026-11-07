@@ -54,17 +54,42 @@ pub fn build_window(a: &App) -> Retained<NSWindow> {
     main.trailingAnchor().constraintEqualToAnchor(&root.trailingAnchor()).setActive(true);
     // Leading edge switches between "after sidebar" and "window edge" (setup).
     let after = main.leadingAnchor().constraintEqualToAnchor(&sidebar.trailingAnchor());
+    let edge = main.leadingAnchor().constraintEqualToAnchor(&root.leadingAnchor());
     after.setActive(true);
+    *a.main_leading.borrow_mut() = Some((after, edge));
     w.setContentView(Some(&root));
     *a.sidebar.borrow_mut() = Some(sidebar.into_view());
     *a.main_area.borrow_mut() = Some(main);
     w
 }
 
+/// Show or collapse the sidebar; the main area then starts at the window edge.
 pub fn show_sidebar(a: &App, visible: bool) {
     if let Some(s) = a.sidebar.borrow().as_ref() {
         s.setHidden(!visible);
     }
+    if let Some((after, edge)) = a.main_leading.borrow().as_ref() {
+        // Deactivate first so the two constraints never conflict.
+        if visible {
+            edge.setActive(false);
+            after.setActive(true);
+        } else {
+            after.setActive(false);
+            edge.setActive(true);
+        }
+    }
+}
+
+fn sidebar_toggle(mtm: MainThreadMarker, target: &Target) -> Retained<NSButton> {
+    let b = button(mtm, "", target);
+    b.setBordered(false);
+    with_symbol(&b, "sidebar.left");
+    b.setImagePosition(NSCellImagePosition::ImageOnly);
+    b.setContentTintColor(Some(&Palette::secondary()));
+    let title = tr("Ẩn/hiện thanh bên", "Show/hide sidebar");
+    b.setToolTip(Some(&ns(&title)));
+    b.setAccessibilityLabel(Some(&ns(&title)));
+    b
 }
 
 fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
@@ -79,6 +104,17 @@ fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
     s.setEdgeInsets(NSEdgeInsets { top: 52.0, left: 10.0, bottom: 14.0, right: 10.0 });
     fx.addSubview(&s);
     pin(&s, &fx, 0.0);
+
+    // Title row, level with the window buttons: [traffic lights] name ... [toggle]
+    let name = label(mtm, "SafeDiskCleaner", &font(13.0, W::Semibold), &Palette::primary());
+    fx.addSubview(&name);
+    name.leadingAnchor().constraintEqualToAnchor_constant(&fx.leadingAnchor(), 78.0).setActive(true);
+    name.centerYAnchor().constraintEqualToAnchor_constant(&fx.topAnchor(), 15.0).setActive(true);
+    let toggle = sidebar_toggle(mtm, &a.keep_target(|a| a.toggle_sidebar()));
+    fx.addSubview(&toggle);
+    toggle.trailingAnchor().constraintEqualToAnchor_constant(&fx.trailingAnchor(), -10.0).setActive(true);
+    toggle.centerYAnchor().constraintEqualToAnchor(&name.centerYAnchor()).setActive(true);
+    name.trailingAnchor().constraintLessThanOrEqualToAnchor_constant(&toggle.leadingAnchor(), -6.0).setActive(true);
 
     let items: [(Page, &str, Retained<NSColor>, String); 4] = [
         (Page::Overview, "square.grid.2x2.fill", Palette::gray(), tr("Tổng quan", "Overview")),
@@ -248,7 +284,7 @@ pub fn render(a: &App) {
         pin(&page, &main, 0.0);
         return;
     }
-    show_sidebar(a, true);
+    show_sidebar(a, !a.sidebar_collapsed.get());
     let body = match a.page.get() {
         Page::Overview => overview_page(a),
         Page::Files => files_page(a, false),
@@ -270,7 +306,11 @@ fn frame(a: &App, title: &str, subtitle: &str, accessories: Vec<Retained<NSView>
     let root = vstack(mtm, 6.0);
     root.setEdgeInsets(NSEdgeInsets { top: 12.0, left: 0.0, bottom: 0.0, right: 0.0 });
     let header = hstack(mtm, 10.0);
-    header.setEdgeInsets(NSEdgeInsets { top: 0.0, left: 24.0, bottom: 4.0, right: 24.0 });
+    let collapsed = a.sidebar_collapsed.get();
+    header.setEdgeInsets(NSEdgeInsets { top: 0.0, left: if collapsed { 84.0 } else { 24.0 }, bottom: 4.0, right: 24.0 });
+    if collapsed {
+        add(&header, &sidebar_toggle(mtm, &a.target(|a| a.toggle_sidebar())));
+    }
     let titles = vstack(mtm, 1.0);
     add(&titles, &label(mtm, title, &font(17.0, W::Bold), &Palette::primary()));
     let status = a.status.borrow().clone();

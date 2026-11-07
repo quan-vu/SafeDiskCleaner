@@ -290,6 +290,9 @@ fn formats() {
 #[test]
 fn live_counters_are_readable() {
     let (r, w) = crate::sysstats::disk_io_totals();
-    assert!(r > 0 || w > 0, "IOKit returned no disk statistics");
+    // CI virtual machines may expose no block-storage statistics.
+    if std::env::var_os("CI").is_none() {
+        assert!(r > 0 || w > 0, "IOKit returned no disk statistics");
+    }
     assert!(!crate::sysstats::mounts().is_empty());
 }
