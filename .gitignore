@@ -1,0 +1,7 @@
+.mygo/
+build/
+dist/
+*.db
+*.db-shm
+*.db-wal
+resources/trash-helper

@@ -1,0 +1,10 @@
+{
+  "name": "Safety Disk Cleaner",
+  "slug": "safety-disk-cleaner",
+  "identifier": "io.github.quan-vu.safetydiskcleaner",
+  "version": "0.1.0",
+  "macos": {
+    "minimumSystemVersion": "13.0",
+    "notarize": { "keychainProfile": "safety-disk-cleaner" }
+  }
+}

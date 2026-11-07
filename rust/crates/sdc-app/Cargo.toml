@@ -1,0 +1,19 @@
+[package]
+name = "sdc-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "safety-disk-cleaner"
+path = "src/main.rs"
+
+[dependencies]
+sdc-core = { path = "../sdc-core" }
+chrono = "0.4"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["block2", "objc2-core-services"] }
+objc2-app-kit = { version = "0.3", features = ["block2"] }
+objc2-user-notifications = { version = "0.3", features = ["block2"] }
+objc2-service-management = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
