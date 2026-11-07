@@ -33,7 +33,7 @@ make run      # bundle and open
 - The UI language follows the system's preferred language (Vietnamese or English).
 - Trash uses `NSFileManager.trashItemAtURL`.
 - Ad-hoc signed only; notarization (Developer ID) is not set up yet.
-- CI (`.github/workflows/build.yml`) runs tests and clippy and uploads the `.app` zip and DMG as build artifacts; pushing a `v*` tag also attaches them to a GitHub Release.
+- CI (`.github/workflows/build.yml`) runs only when a `v*` tag is pushed: tests, clippy, then the `.app` zip and DMG are uploaded as artifacts and attached to a GitHub Release.
 
 ## Testing with fake files (never touches real data)
 
