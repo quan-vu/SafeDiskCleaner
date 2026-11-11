@@ -23,6 +23,20 @@ Download the DMG or zip from the [latest release](https://github.com/quan-vu/Saf
 right-click the app and choose **Open**, or run
 `xattr -dr com.apple.quarantine "/Applications/Safety Disk Cleaner.app"`.
 
+## Privacy
+
+- Everything runs locally. The app has no telemetry, no account and no network code of its own.
+- Settings, ignored files and cleanup history live in a local SQLite file:
+  `~/Library/Application Support/Safety Disk Cleaner/cleaner.db`.
+- The optional AI review (**Settings → Review with Claude CLI**) runs the `claude` CLI installed on your Mac.
+  It is **on by default** and is skipped when the CLI is not found. When it runs, only the file path, size and
+  dates of each candidate are sent, never file contents, and at most 100 candidates per scan.
+  Turn it off in Settings if you do not want paths to leave your machine.
+- AI verdicts are advisory: protected folders (Library, iCloud, `.git`, `.ssh`, ...) and files with an unknown or
+  recent last use can never be promoted to "safe", and every file is re-checked right before cleanup.
+- Files are moved to the Trash, never deleted automatically. "Delete permanently" always asks first.
+- Debug tracing (`SDC_DEBUG=1`) prints actions to stderr only when you set it yourself.
+
 ## Layout
 
 | Path | What |
