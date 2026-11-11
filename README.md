@@ -1,9 +1,9 @@
 # SafeDiskCleaner
 
 Native macOS disk-cleanup assistant written in Rust + AppKit (through `objc2`).
-It finds large, old files, asks the Claude CLI for a conservative second opinion
-(metadata only, never file contents) and lets you move them to the Trash. Nothing is
-ever deleted automatically.
+It finds large, old files, can optionally ask the Claude CLI for a conservative second
+opinion (opt-in, metadata only, never file contents) and lets you move them to the Trash.
+Nothing is ever deleted automatically.
 
 Data lives in `~/Library/Application Support/Safety Disk Cleaner/cleaner.db`
 (the same database the earlier Go version used, so settings carry over).
@@ -29,9 +29,9 @@ right-click the app and choose **Open**, or run
 - Settings, ignored files and cleanup history live in a local SQLite file:
   `~/Library/Application Support/Safety Disk Cleaner/cleaner.db`.
 - The optional AI review (**Settings → Review with Claude CLI**) runs the `claude` CLI installed on your Mac.
-  It is **on by default** and is skipped when the CLI is not found. When it runs, only the file path, size and
-  dates of each candidate are sent, never file contents, and at most 100 candidates per scan.
-  Turn it off in Settings if you do not want paths to leave your machine.
+  It is **off by default**; nothing leaves your machine unless you turn it on. When it runs, only the file path,
+  size and dates of each candidate are sent, never file contents, and at most 100 candidates per scan.
+  It is skipped when the CLI is not found.
 - AI verdicts are advisory: protected folders (Library, iCloud, `.git`, `.ssh`, ...) and files with an unknown or
   recent last use can never be promoted to "safe", and every file is re-checked right before cleanup.
 - Files are moved to the Trash, never deleted automatically. "Delete permanently" always asks first.

@@ -35,8 +35,8 @@ pub struct Settings {
     pub open_at_login: bool,
     #[serde(default)]
     pub scan_home: bool,
-    /// New in the Rust version; absent in Go data means enabled.
-    #[serde(default = "yes")]
+    /// Opt-in: sends paths, sizes and dates to the local `claude` CLI. Off unless the user turns it on.
+    #[serde(default)]
     pub ai_review: bool,
     #[serde(default, deserialize_with = "null_vec")]
     pub roots: Vec<String>,
@@ -56,10 +56,6 @@ pub struct Settings {
     pub last_alert_ids: Vec<String>,
 }
 
-fn yes() -> bool {
-    true
-}
-
 impl Settings {
     pub fn default_for(home: &Path) -> Self {
         Settings {
@@ -67,7 +63,7 @@ impl Settings {
             auto_scan: true,
             open_at_login: true,
             scan_home: false,
-            ai_review: true,
+            ai_review: false,
             roots: vec![home.join("Downloads").to_string_lossy().into_owned()],
             exclusions: vec![],
             min_size_bytes: 500 * MB,

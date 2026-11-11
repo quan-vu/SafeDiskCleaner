@@ -170,7 +170,7 @@ fn claude_cannot_promote_unknown_use_or_protected() {
 fn reads_go_json_and_roundtrips_store() {
     let settings_json = r#"{"setupDone":true,"autoScan":true,"openAtLogin":true,"scanHome":true,"roots":["/Users/q/Downloads"],"exclusions":null,"minSizeBytes":500000000,"minAgeDays":90,"redGB":10,"yellowGB":30,"lastScan":"2026-11-07T21:45:20.952217+07:00","lastAlertLevel":"green","lastAlertIds":["1:2"]}"#;
     let s: Settings = serde_json::from_str(settings_json).unwrap();
-    assert!(s.scan_home && s.ai_review && s.exclusions.is_empty());
+    assert!(s.scan_home && !s.ai_review && s.exclusions.is_empty());
     let zero: Settings = serde_json::from_str(&settings_json.replace("2026-11-07T21:45:20.952217+07:00", "0001-01-01T00:00:00Z")).unwrap();
     assert!(is_zero_time(&zero.last_scan));
 
