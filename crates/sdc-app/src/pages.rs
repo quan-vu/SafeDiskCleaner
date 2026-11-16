@@ -260,8 +260,13 @@ pub fn fill_tray_menu(a: &App, item: &NSStatusItem) {
         &format!("{n} files to review · up to {}", format::bytes(safe + review)),
     ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Tray menu targets live in their own list, replaced on every refresh. They
+    // must not share `a.keep` with the sidebar buttons' targets: controls don't
+    // retain their target, so trimming that list would free live targets.
+    let targets: std::cell::RefCell<Vec<Retained<Target>>> = std::cell::RefCell::new(vec![]);
     let action = |title: &str, key: &str, f: fn(&App)| {
-        let t = a.keep_target(f);
+        let t = Target::new(mtm, move |_| f(&app()));
+        targets.borrow_mut().push(t.clone());
         let mi = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &ns(title), Some(fire_sel()), &ns(key))
         };
@@ -283,12 +288,8 @@ pub fn fill_tray_menu(a: &App, item: &NSStatusItem) {
     };
     menu.addItem(&quit);
     item.setMenu(Some(&menu));
-    // Tray targets accumulate across refreshes; keep only the latest set alive.
-    let mut keep = a.keep.borrow_mut();
-    let n = keep.len();
-    if n > 12 {
-        keep.drain(0..n - 3);
-    }
+    // The old menu is gone now, so its targets can be released.
+    *a.tray_targets.borrow_mut() = targets.into_inner();
 }
 
 pub fn fmt_time(t: &chrono::DateTime<chrono::Utc>) -> String {

@@ -154,6 +154,8 @@ pub struct App {
     pub footer_machine: RefCell<Option<Retained<NSTextField>>>,
     pub page_targets: RefCell<Vec<Retained<Target>>>,
     pub keep: RefCell<Vec<Retained<Target>>>,
+    /// Targets of the current tray menu (replaced on each refresh).
+    pub tray_targets: RefCell<Vec<Retained<Target>>>,
     pub refs: RefCell<Refs>,
     pub status_item: RefCell<Option<Retained<NSStatusItem>>>,
     pub draft: RefCell<Option<Settings>>,
@@ -243,6 +245,7 @@ impl App {
             footer_machine: RefCell::new(None),
             page_targets: RefCell::new(vec![]),
             keep: RefCell::new(vec![]),
+            tray_targets: RefCell::new(vec![]),
             refs: RefCell::new(Refs::default()),
             status_item: RefCell::new(None),
             draft: RefCell::new(None),
