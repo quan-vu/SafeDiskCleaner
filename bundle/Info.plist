@@ -14,6 +14,9 @@
   <key>CFBundleLocalizations</key><array><string>en</string><string>vi</string></array>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Safety Disk Cleaner looks for large, old files in your Documents folder so you can review them. Nothing is deleted without your confirmation.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Safety Disk Cleaner looks for large, old files in your Downloads folder so you can review them. Nothing is deleted without your confirmation.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Safety Disk Cleaner looks for large, old files on your Desktop only if you allow it in Settings. Nothing is deleted without your confirmation.</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>

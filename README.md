@@ -43,6 +43,10 @@ right-click the app and choose **Open**, or run
   It is skipped when the CLI is not found.
 - AI verdicts are advisory: protected folders (Library, iCloud, `.git`, `.ssh`, ...) and files with an unknown or
   recent last use can never be promoted to "safe", and every file is re-checked right before cleanup.
+- Folder access: only **Documents** and **Downloads** are read by default (Settings → Scan folders → "Private
+  folders the app may read"; Desktop is opt-in). A folder that is not ticked is never opened, so macOS never asks
+  about it, even when scanning all of Home. iCloud Drive and other cloud-synced folders are skipped and protected
+  from cleanup; "Include iCloud Drive in Storage" only adds them to the Storage chart.
 - Files are moved to the Trash, never deleted automatically. "Delete permanently" always asks first.
 - Debug tracing (`SDC_DEBUG=1`) prints actions to stderr only when you set it yourself.
 
