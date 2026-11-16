@@ -11,6 +11,7 @@ use objc2_app_kit::*;
 use objc2_foundation::*;
 use sdc_core::category::Category;
 use sdc_core::format;
+use sdc_core::overview::{pack, CardPref, CardSize, GRID_COLUMNS};
 use sdc_core::model::*;
 use sdc_core::snapshot::{compare, Snapshot};
 use sdc_core::sysstats::ProcIo;
@@ -118,11 +119,12 @@ fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
     toggle.centerYAnchor().constraintEqualToAnchor(&name.centerYAnchor()).setActive(true);
     name.trailingAnchor().constraintLessThanOrEqualToAnchor_constant(&toggle.leadingAnchor(), -6.0).setActive(true);
 
-    let items: [(Page, &str, Retained<NSColor>, String); 5] = [
+    let items: [(Page, &str, Retained<NSColor>, String); 6] = [
         (Page::Overview, "square.grid.2x2.fill", Palette::gray(), tr("Tổng quan", "Overview")),
         (Page::Files, "list.bullet", Palette::green(), tr("Tệp cần xem", "Files to review")),
         (Page::Disk, "waveform.path.ecg", Palette::orange(), tr("Hoạt động đĩa", "Disk activity")),
         (Page::Volumes, "internaldrive.fill", Palette::indigo(), tr("Ổ đĩa", "Volumes")),
+        (Page::Storage, "chart.pie.fill", Palette::blue(), tr("Dung lượng thư mục", "Storage")),
         (Page::Changes, "calendar", Palette::cyan(), tr("Thay đổi theo ngày", "Daily changes")),
     ];
     for (page, sym, color, title) in items {
@@ -243,6 +245,14 @@ pub fn fill_tray_menu(a: &App, item: &NSStatusItem) {
             level_text(v.level)
         ));
     }
+    let mut lines = vec![];
+    for id in ["temp", "cpu", "ram"] {
+        let mi = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &ns(&a.tray_line(id)), None, &ns("")) };
+        mi.setEnabled(false);
+        menu.addItem(&mi);
+        lines.push((id, mi));
+    }
+    *a.tray_lines.borrow_mut() = lines;
     let (safe, _, review, _) = a.reclaimable();
     let n = a.active().len();
     info(&tr(
@@ -322,6 +332,7 @@ pub fn render(a: &App) {
         Page::Files => files_page(a, Mode::Review),
         Page::Ignored => files_page(a, Mode::Ignored),
         Page::Changes => changes_page(a),
+        Page::Storage => storage_page(a),
         Page::List(id) => {
             if !a.lists.borrow().iter().any(|l| l.id == id) {
                 a.page.set(Page::Files);
@@ -424,127 +435,360 @@ fn card_header(mtm: MainThreadMarker, sym: &str, color: &NSColor, title: &str, t
 
 // ================================================================ overview
 
+const CARD_ROW_H: f64 = 190.0;
+
 fn overview_page(a: &App) -> Retained<NSView> {
     let mtm = a.mtm;
     let s = page_stack(mtm);
+    let cards = a.cards();
+    let sizes: Vec<CardSize> = cards.iter().map(|c| c.size).collect();
+    let (places, rows) = pack(&sizes, GRID_COLUMNS);
+    let grid = CardGrid::new(mtm, GRID_COLUMNS, CARD_ROW_H, 16.0);
+    for (i, (c, p)) in cards.iter().zip(places).enumerate() {
+        let v = overview_card(a, c, i, cards.len());
+        grid.put(&v, p.col, p.row, p.cols, p.rows);
+    }
+    grid.set_rows(rows);
+    add_full(&s, &grid);
+
+    let mut acc: Vec<Retained<NSView>> = vec![];
+    if a.arranging.get() {
+        acc.push(button(mtm, &tr("Đặt lại", "Reset layout"), &a.target(|a| a.reset_cards())).into_view());
+        let done = primary_button(mtm, &tr("Xong", "Done"), &a.target(|a| {
+            a.arranging.set(false);
+            a.request_render();
+        }));
+        acc.push(done.into_view());
+    } else {
+        let arrange = button(mtm, &tr("Sắp xếp thẻ", "Arrange cards"), &a.target(|a| {
+            a.arranging.set(true);
+            a.request_render();
+        }));
+        with_symbol(&arrange, "square.grid.2x2");
+        acc.push(arrange.into_view());
+        acc.push(scan_button(a));
+    }
+    let subtitle = if a.arranging.get() {
+        tr("Chọn cỡ S, M, L cho từng thẻ và di chuyển bằng mũi tên", "Choose a size (S, M, L) for each card and move cards with the arrows")
+    } else {
+        format!("{} {}", tr("Lần quét gần nhất:", "Last scan:"), fmt_time(&a.settings.borrow().last_scan))
+    };
+    let sc = scroller(mtm, &s);
+    frame(a, &tr("Tổng quan", "Overview"), &subtitle, acc, &sc)
+}
+
+/// Card shell for the overview grid: content pinned to the top, clipped to the cell.
+fn overview_card(a: &App, c: &CardPref, index: usize, count: usize) -> Retained<NSView> {
+    let mtm = a.mtm;
+    let b = boxed(mtm, &Palette::card(), 14.0);
+    if a.arranging.get() {
+        b.setBorderColor(&Palette::tint(&Palette::blue(), 0.6));
+        b.setBorderWidth(1.5);
+    }
+    b.setWantsLayer(true);
+    if let Some(layer) = b.layer() {
+        layer.setMasksToBounds(true);
+    }
+    let st = vstack(mtm, 10.0);
+    st.setEdgeInsets(NSEdgeInsets { top: 16.0, left: 18.0, bottom: 16.0, right: 18.0 });
+    b.addSubview(&st);
+    st.topAnchor().constraintEqualToAnchor(&b.topAnchor()).setActive(true);
+    st.leadingAnchor().constraintEqualToAnchor(&b.leadingAnchor()).setActive(true);
+    st.trailingAnchor().constraintEqualToAnchor(&b.trailingAnchor()).setActive(true);
+    st.bottomAnchor().constraintLessThanOrEqualToAnchor(&b.bottomAnchor()).setActive(true);
+    if a.arranging.get() {
+        add_full(&st, &arrange_bar(a, c, index, count));
+    }
+    match c.id.as_str() {
+        "disk" => disk_card(a, &st, c.size),
+        "temp" => temp_card(a, &st, c.size),
+        "cpu" => cpu_card(a, &st, c.size),
+        _ => ram_card(a, &st, c.size),
+    }
+    b.into_view()
+}
+
+fn arrange_bar(a: &App, c: &CardPref, index: usize, count: usize) -> Retained<NSStackView> {
+    let mtm = a.mtm;
+    let h = hstack(mtm, 6.0);
+    let sel = match c.size {
+        CardSize::S => 0,
+        CardSize::M => 1,
+        CardSize::L => 2,
+    };
+    let seg = segmented(mtm, &["S", "M", "L"], sel, &a.target(|_| {}));
+    let seg_ref = seg.clone();
+    let id = c.id.clone();
+    let t = a.target(move |a| {
+        let size = match seg_ref.selectedSegment() {
+            0 => CardSize::S,
+            1 => CardSize::M,
+            _ => CardSize::L,
+        };
+        let id = id.clone();
+        later(move |a| a.set_card_size(&id, size));
+        let _ = a;
+    });
+    unsafe { seg.setTarget(Some(&t)) };
+    seg.setToolTip(Some(&ns(&tr("Cỡ thẻ", "Card size"))));
+    add(&h, &seg);
+    add(&h, &spacer(mtm));
+    for (sym, step, enabled, tip) in [
+        ("chevron.left", -1isize, index > 0, tr("Đưa lên trước", "Move earlier")),
+        ("chevron.right", 1isize, index + 1 < count, tr("Đưa ra sau", "Move later")),
+    ] {
+        let id = c.id.clone();
+        let b = button(mtm, "", &a.target(move |_| {
+            let id = id.clone();
+            later(move |a| a.move_card(&id, step));
+        }));
+        with_symbol(&b, sym);
+        b.setImagePosition(NSCellImagePosition::ImageOnly);
+        b.setEnabled(enabled);
+        b.setToolTip(Some(&ns(&tip)));
+        b.setAccessibilityLabel(Some(&ns(&tip)));
+        add(&h, &b);
+    }
+    h
+}
+
+/// Icon tile + title (+ optional trailing view) for an overview card.
+fn card_title(mtm: MainThreadMarker, sym: &str, color: &NSColor, title: &str, sub: Option<&str>, trailing: Option<Retained<NSView>>) -> Retained<NSStackView> {
+    let h = hstack(mtm, 10.0);
+    add(&h, &icon_tile(mtm, sym, &Palette::tint(color, 0.18), color, 28.0, 13.0));
+    let t = vstack(mtm, 1.0);
+    add(&t, &label(mtm, title, &font(14.0, W::Semibold), &Palette::primary()));
+    if let Some(sub) = sub {
+        add(&t, &label(mtm, sub, &font(12.0, W::Regular), &Palette::secondary()));
+    }
+    add(&h, &t);
+    add(&h, &spacer(mtm));
+    if let Some(v) = trailing {
+        add(&h, &v);
+    }
+    h
+}
+
+/// "name ........ value" row with a hairline under it.
+fn value_row(mtm: MainThreadMarker, dot_color: Option<&NSColor>, name: &str, value: &str, note: Option<&str>) -> (Retained<NSStackView>, Retained<NSTextField>) {
+    let h = hstack(mtm, 10.0);
+    h.heightAnchor().constraintEqualToConstant(34.0).setActive(true);
+    if let Some(c) = dot_color {
+        add(&h, &dot(mtm, c, 8.0));
+    }
+    let n = label(mtm, name, &font(13.0, W::Regular), &Palette::primary());
+    n.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    n.setContentCompressionResistancePriority_forOrientation(100.0, NSLayoutConstraintOrientation::Horizontal);
+    add(&h, &n);
+    add(&h, &spacer(mtm));
+    let v = label(mtm, value, &digits(13.0, W::Semibold), &Palette::primary());
+    add(&h, &v);
+    if let Some(note) = note {
+        let l = label(mtm, note, &font(12.0, W::Regular), &Palette::secondary());
+        l.setAlignment(NSTextAlignment::Right);
+        size(&l, 64.0, 0.0);
+        add(&h, &l);
+    }
+    (h, v)
+}
+
+fn hero_size(size: CardSize, big: bool) -> f64 {
+    match (size, big) {
+        (CardSize::S, true) => 34.0,
+        (CardSize::M, true) => 44.0,
+        (CardSize::L, true) => 56.0,
+        (CardSize::S, false) => 28.0,
+        (CardSize::M, false) => 30.0,
+        (CardSize::L, false) => 34.0,
+    }
+}
+
+fn caption(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+    label(mtm, text, &font(12.0, W::Medium), &Palette::secondary())
+}
+
+fn disk_card(a: &App, st: &NSStackView, size: CardSize) {
+    let mtm = a.mtm;
+    let Some(v) = a.volumes.borrow().first().cloned() else {
+        add_full(st, &card_title(mtm, "internaldrive.fill", &Palette::indigo(), &tr("Ổ đĩa", "Disk"), None, None));
+        add(st, &label(mtm, &tr("Chưa đọc được thông tin ổ đĩa.", "Disk information is unavailable."), &font(13.0, W::Regular), &Palette::secondary()));
+        return;
+    };
     let (safe, n_safe, review, n_review) = a.reclaimable();
-    let vols = a.volumes.borrow().clone();
-    if vols.is_empty() {
-        let (c, inner) = card(mtm, 20.0, 8.0);
-        add(&inner, &label(mtm, &tr("Chưa đọc được thông tin ổ đĩa.", "Disk information is unavailable."), &font(13.0, W::Regular), &Palette::secondary()));
-        add_full(&s, &c);
+    let sub = format!("{} · {}", v.fs_type, v.bsd_name);
+    let pill = badge(mtm, &level_text(v.level), &level_color(v.level)).into_view();
+    add_full(st, &card_title(mtm, "internaldrive.fill", &Palette::indigo(), &v.name, (size != CardSize::S).then_some(sub.as_str()), Some(pill)));
+    let g = vstack(mtm, 2.0);
+    add(&g, &caption(mtm, &tr("Dung lượng trống", "Free space")));
+    let (n, u) = format::bytes_parts(v.free_bytes);
+    add(&g, &hero_total(mtm, &n, &u, &format!("/ {}", format::bytes(v.total_bytes)), hero_size(size, true)));
+    add_full(st, &g);
+    let total = v.total_bytes.max(1) as f64;
+    let used = (v.total_bytes - v.free_bytes) as f64 / total;
+    let rec = ((safe + review) as f64 / total).min(used);
+    add_full(st, &Bar::new(mtm, 10.0, vec![(0.0, used - rec, Palette::indigo()), (used - rec, used, Palette::orange())], 2.0));
+    if size != CardSize::S {
+        let lg = hstack(mtm, 16.0);
+        add(&lg, &legend(mtm, &Palette::indigo(), &format!("{} {}", tr("Đã dùng", "Used"), format::bytes(v.total_bytes - v.free_bytes - safe - review))));
+        add(&lg, &legend(mtm, &Palette::orange(), &format!("{} {}", tr("Có thể dọn", "Reclaimable"), format::bytes(safe + review))));
+        add(&lg, &legend(mtm, &Palette::track(), &format!("{} {}", tr("Trống", "Free"), format::bytes(v.free_bytes))));
+        add(st, &lg);
     }
-    for (i, v) in vols.iter().enumerate() {
-        add_full(&s, &volume_card(a, v, if i == 0 { safe + review } else { 0 }, true));
+    if size == CardSize::L {
+        add_full(st, &separator(mtm));
+        let files = |n: usize| tr(&format!("{n} tệp"), &format!("{n} files"));
+        add_full(st, &value_row(mtm, Some(&Palette::green()), &tr("An toàn để dọn", "Safe to clean"), &format::bytes(safe), Some(&files(n_safe))).0);
+        add_full(st, &value_row(mtm, Some(&Palette::yellow()), &tr("Cần xem lại", "Needs review"), &format::bytes(review), Some(&files(n_review))).0);
+        let foot = hstack(mtm, 8.0);
+        let s = a.settings.borrow();
+        let next = if s.auto_scan { format!(" · {} {}", tr("tự quét mỗi", "auto-scan every"), interval_text(s.scan_interval_minutes)) } else { String::new() };
+        add(&foot, &label(mtm, &format!("{} {}{next}", tr("Lần quét:", "Last scan:"), fmt_time(&s.last_scan)), &font(12.0, W::Regular), &Palette::secondary()));
+        drop(s);
+        add(&foot, &spacer(mtm));
+        add(&foot, &link_button(mtm, &tr("Xem tệp →", "Review files →"), &Palette::blue(), &a.target(|a| a.navigate(Page::Files))));
+        add_full(st, &foot);
     }
+}
 
-    let row = columns(mtm, 16.0);
-    // Cleanup suggestions
-    let (c1, inner) = card(mtm, 20.0, 6.0);
-    add_full(&inner, &card_header(mtm, "checkmark.shield.fill", &Palette::green(), &tr("Gợi ý dọn dẹp", "Cleanup suggestions"), None));
-    inner.setCustomSpacing_afterView(14.0, &inner.arrangedSubviews().lastObject().unwrap());
-    add(&inner, &label(mtm, &tr("Có thể giải phóng tối đa", "Up to"), &font(13.0, W::Regular), &Palette::secondary()));
-    let (n, u) = format::bytes_parts(safe + review);
-    add(&inner, &hero(mtm, &n, &u, 40.0));
-    let total = (safe + review).max(1) as f64;
-    let split = Bar::new(mtm, 8.0, vec![(0.0, safe as f64 / total, Palette::green()), (safe as f64 / total, 1.0, Palette::yellow())], 2.0);
-    add_full(&inner, &split);
-    let lg = hstack(mtm, 16.0);
-    add(&lg, &legend(mtm, &Palette::green(), &tr(&format!("{n_safe} an toàn · {}", format::bytes(safe)), &format!("{n_safe} safe · {}", format::bytes(safe)))));
-    add(&lg, &legend(mtm, &Palette::yellow(), &tr(&format!("{n_review} cần xem · {}", format::bytes(review)), &format!("{n_review} to review · {}", format::bytes(review)))));
-    add(&inner, &lg);
-    add(&inner, &spacer(mtm));
-    let foot = hstack(mtm, 8.0);
-    add(&foot, &label(mtm, &tr("Chỉ giải phóng sau khi dọn Thùng rác", "Reclaimed after emptying the Trash"), &font(12.0, W::Regular), &Palette::tertiary()));
-    add(&foot, &spacer(mtm));
-    let count = n_safe + n_review;
-    add(&foot, &link_button(mtm, &tr(&format!("Xem {count} tệp"), &format!("Review {count} files")), &Palette::green(), &a.target(|a| a.navigate(Page::Files))));
-    add_full(&inner, &foot);
-    add(&row, &c1);
+fn temp_card(a: &App, st: &NSStackView, size: CardSize) {
+    let mtm = a.mtm;
+    let (_, _, _, temp) = a.live_metrics();
+    add_full(st, &card_title(mtm, "clock.arrow.circlepath", &Palette::orange(), &tr("Tệp tạm", "Temporary"), None, None));
+    let Some(t) = temp else {
+        add(st, &hero_total(mtm, "…", "", "", hero_size(size, false)));
+        add(st, &caption(mtm, &tr("Đang đo bộ nhớ đệm, nhật ký, Thùng rác…", "Measuring caches, logs and Trash…")));
+        return;
+    };
+    let g = vstack(mtm, 2.0);
+    let total = format::bytes(t.total());
+    let (n, u) = total.rsplit_once(' ').unwrap_or((&total, ""));
+    add(&g, &hero_total(mtm, n, u, "", hero_size(size, false)));
+    add(&g, &caption(mtm, &tr("bộ nhớ đệm, nhật ký, Thùng rác", "caches, logs, Trash")));
+    add_full(st, &g);
+    if size == CardSize::S {
+        return;
+    }
+    let sum = t.total().max(1) as f64;
+    let (c, l) = (t.caches as f64 / sum, t.logs as f64 / sum);
+    let light = Palette::tint(&Palette::orange(), 0.45);
+    add_full(st, &Bar::new(mtm, 8.0, vec![(0.0, c, Palette::orange()), (c, c + l, Palette::brown()), (c + l, 1.0, light.clone())], 2.0));
+    if size == CardSize::M {
+        let lg = hstack(mtm, 14.0);
+        add(&lg, &legend(mtm, &Palette::orange(), &format!("{} {}", tr("Đệm", "Caches"), format::bytes(t.caches))));
+        add(&lg, &legend(mtm, &Palette::brown(), &format!("{} {}", tr("Nhật ký", "Logs"), format::bytes(t.logs))));
+        add(&lg, &legend(mtm, &light, &format!("{} {}", tr("Thùng rác", "Trash"), format::bytes(t.trash))));
+        add(st, &lg);
+        return;
+    }
+    add_full(st, &separator(mtm));
+    let home = a.home.clone();
+    for (color, name, path, bytes) in [
+        (Palette::orange(), "~/Library/Caches".to_string(), home.join("Library/Caches"), t.caches),
+        (Palette::brown(), "~/Library/Logs".to_string(), home.join("Library/Logs"), t.logs),
+        (light, tr("Thùng rác", "Trash"), home.join(".Trash"), t.trash),
+    ] {
+        let (row, _) = value_row(mtm, Some(&color), &name, &format::bytes(bytes), None);
+        let p = path.to_string_lossy().into_owned();
+        let reveal = link_button(mtm, &tr("Mở", "Reveal"), &Palette::blue(), &a.target(move |_| system::reveal(std::slice::from_ref(&p))));
+        add(&row, &reveal);
+        add_full(st, &row);
+    }
+    add(st, &wrapping(mtm, &tr("Ứng dụng tự tạo lại bộ nhớ đệm khi cần. Không có gì ở đây bị xoá tự động.", "Apps rebuild caches as needed. Nothing here is removed automatically."), &font(12.0, W::Regular), &Palette::tertiary()));
+}
 
-    // Mini disk activity
-    let (c2, inner) = card(mtm, 20.0, 10.0);
-    let lg = hstack(mtm, 12.0);
-    add(&lg, &legend(mtm, &Palette::orange(), &tr("Ghi", "Write")));
-    add(&lg, &legend(mtm, &Palette::cyan(), &tr("Đọc", "Read")));
-    add_full(&inner, &card_header(mtm, "waveform.path.ecg", &Palette::orange(), &tr("Hoạt động đĩa", "Disk activity"), Some(lg.into_view())));
-    let stats = hstack(mtm, 28.0);
-    stats.setAlignment(NSLayoutAttribute::LastBaseline);
-    let rate = hero(mtm, "0", "MB/s", 40.0);
-    add(&stats, &rate);
-    let (r, rl) = stat(mtm, &tr("Đọc", "Read"), "—", None);
-    let (w, wl) = stat(mtm, &tr("Ghi", "Write"), "—", None);
-    add(&stats, &r);
-    add(&stats, &w);
-    add(&inner, &stats);
-    let chart = DotChart::new(mtm, 7.0, 4.0, 62.0);
-    add_full(&inner, &chart_box(mtm, &chart));
-    add(&row, &c2);
-    c1.heightAnchor().constraintEqualToAnchor(&c2.heightAnchor()).setActive(true);
-    add_full(&s, &row);
+fn cpu_card(a: &App, st: &NSStackView, size: CardSize) {
+    let mtm = a.mtm;
+    let (cpu, cores, _, _) = a.live_metrics();
+    add_full(st, &card_title(mtm, "cpu", &Palette::cyan(), "CPU", None, None));
+    let g = vstack(mtm, 2.0);
+    let hs = hero_size(size, false);
+    let now = cpu.last().copied().unwrap_or(0.0);
+    let hero = hero_total(mtm, &format!("{now:.0}"), "%", "", hs);
+    add(&g, &hero);
+    add(&g, &caption(mtm, &tr(&format!("trên {cores} nhân"), &format!("of {cores} cores"))));
+    add_full(st, &g);
+    let mut refs_spark = None;
+    let mut stats = vec![];
+    if size != CardSize::S {
+        let sp = Spark::new(mtm, if size == CardSize::L { 120.0 } else { 46.0 }, 100.0, &Palette::cyan());
+        sp.set_values(cpu.clone());
+        add_full(st, &sp);
+        refs_spark = Some(sp);
+    }
+    if size == CardSize::L {
+        add_full(st, &separator(mtm));
+        let (r1, v1) = value_row(mtm, None, &tr("Trung bình 2 phút", "Average, last 2 min"), "—", None);
+        let (r2, v2) = value_row(mtm, None, &tr("Cao nhất 2 phút", "Peak, last 2 min"), "—", None);
+        add_full(st, &r1);
+        add_full(st, &r2);
+        stats = vec![v1, v2];
+    }
+    let mut refs = a.refs.borrow_mut();
+    refs.cpu_value = Some((hero, hs));
+    refs.cpu_spark = refs_spark;
+    refs.cpu_stats = stats;
+}
+
+fn ram_card(a: &App, st: &NSStackView, size: CardSize) {
+    let mtm = a.mtm;
+    let (_, _, mem, _) = a.live_metrics();
+    let m = mem.unwrap_or_default();
+    let ratio = m.used() as f64 / m.total.max(1) as f64;
+    let (ptext, pcolor) = if ratio < 0.8 {
+        (tr("Bình thường", "Normal"), Palette::green())
+    } else if ratio < 0.92 {
+        (tr("Khá cao", "Elevated"), Palette::yellow())
+    } else {
+        (tr("Cao", "High"), Palette::red())
+    };
+    let pill = (size != CardSize::S && mem.is_some()).then(|| badge(mtm, &ptext, &pcolor).into_view());
+    add_full(st, &card_title(mtm, "memorychip", &Palette::blue(), &tr("Bộ nhớ", "Memory"), None, pill));
+    let hs = hero_size(size, false);
+    let used = gib(m.used());
+    let (n, u) = used.rsplit_once(' ').unwrap_or((&used, ""));
+    let hero = hero_total(mtm, n, u, &format!("/ {}", gib(m.total)), hs);
+    add(st, &hero);
+    let mut bar_ref = None;
+    let mut labels = vec![];
+    if size != CardSize::S {
+        let t = m.total.max(1) as f64;
+        let bar = Bar::new(mtm, 8.0, mem_segments(m.app as f64 / t, m.wired as f64 / t, m.compressed as f64 / t), 2.0);
+        add_full(st, &bar);
+        bar_ref = Some(bar);
+    }
+    let light = Palette::tint(&Palette::blue(), 0.45);
+    if size == CardSize::M {
+        let lg = hstack(mtm, 14.0);
+        for (part, color) in [(0u8, Palette::blue()), (1, Palette::indigo()), (2, light.clone())] {
+            let row = hstack(mtm, 6.0);
+            add(&row, &dot(mtm, &color, 8.0));
+            let l = label(mtm, "", &font(12.0, W::Regular), &Palette::secondary());
+            add(&row, &l);
+            add(&lg, &row);
+            labels.push((part, l, true));
+        }
+        add(st, &lg);
+    }
+    if size == CardSize::L {
+        add_full(st, &separator(mtm));
+        for (part, color, name) in [
+            (0u8, Some(Palette::blue()), tr("Bộ nhớ ứng dụng", "App memory")),
+            (1, Some(Palette::indigo()), tr("Cố định (hệ thống)", "Wired (system)")),
+            (2, Some(light.clone()), tr("Đã nén", "Compressed")),
+            (3, None, tr("Còn trống", "Available")),
+        ] {
+            let (row, v) = value_row(mtm, color.as_deref(), &name, "", None);
+            add_full(st, &row);
+            labels.push((part, v, false));
+        }
+    }
     {
         let mut refs = a.refs.borrow_mut();
-        refs.rate_total = Some(rate);
-        refs.rate_read = Some(rl);
-        refs.rate_write = Some(wl);
-        refs.chart = Some(chart);
+        refs.mem_value = Some((hero, hs));
+        refs.mem_bar = bar_ref;
+        refs.mem_labels = labels;
     }
-
-    // Largest files
-    let mut top = a.active();
-    top.sort_by_key(|c| std::cmp::Reverse(c.size));
-    top.truncate(8);
-    if !top.is_empty() {
-        let (c3, inner) = card(mtm, 18.0, 8.0);
-        let more = link_button(mtm, &tr("Xem tất cả", "Show all"), &Palette::blue(), &a.target(|a| a.navigate(Page::Files)));
-        add_full(&inner, &card_header(mtm, "doc.fill", &Palette::blue(), &tr("Tệp lớn nhất", "Largest files"), Some(more.into_view())));
-        let grid = columns(mtm, 48.0);
-        let left = vstack(mtm, 0.0);
-        let right = vstack(mtm, 0.0);
-        for (i, c) in top.iter().enumerate() {
-            let col = if i % 2 == 0 { &left } else { &right };
-            add_full(col, &file_line(a, c));
-        }
-        add(&grid, &left);
-        add(&grid, &right);
-        add_full(&inner, &grid);
-        add_full(&s, &c3);
-    }
-    let subtitle = format!(
-        "{} {} · {} {}",
-        tr("Lần quét gần nhất:", "Last scan:"),
-        fmt_time(&a.settings.borrow().last_scan),
-        vols.len(),
-        tr("ổ đĩa", if vols.len() == 1 { "volume" } else { "volumes" })
-    );
-    let sc = scroller(mtm, &s);
-    frame(a, &tr("Tổng quan", "Overview"), &subtitle, vec![scan_button(a)], &sc)
-}
-
-fn file_line(a: &App, c: &Candidate) -> Retained<NSView> {
-    let mtm = a.mtm;
-    let h = hstack(mtm, 10.0);
-    h.heightAnchor().constraintEqualToConstant(32.0).setActive(true);
-    add(&h, &dot(mtm, &safety_color(c), 8.0));
-    let p = Path::new(&c.path);
-    let name = label(mtm, &p.file_name().unwrap_or_default().to_string_lossy(), &font(14.0, W::Regular), &Palette::primary());
-    add(&h, &name);
-    let dir = p.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-    add(&h, &label(mtm, &dir, &font(12.0, W::Regular), &Palette::tertiary()));
-    add(&h, &spacer(mtm));
-    let size = label(mtm, &format::bytes(c.size), &digits(14.0, W::Semibold), &Palette::primary());
-    size.setContentCompressionResistancePriority_forOrientation(800.0, NSLayoutConstraintOrientation::Horizontal);
-    add(&h, &size);
-    h.into_view()
-}
-
-fn safety_color(c: &Candidate) -> Retained<NSColor> {
-    match (c.ignored, c.safety) {
-        (true, _) => Palette::gray(),
-        (_, Safety::Safe) => Palette::green(),
-        (_, Safety::Protected) => Palette::gray(),
-        _ => Palette::yellow(),
-    }
+    a.update_live_cards();
 }
 
 fn chart_box(mtm: MainThreadMarker, chart: &DotChart) -> Retained<NSBox> {
@@ -1198,6 +1442,183 @@ fn history_page(a: &App) -> Retained<NSView> {
     frame(a, &tr("Lịch sử", "History"), &tr(&format!("{} thao tác gần nhất", records.len()), &format!("{} recent actions", records.len())), vec![], &sc)
 }
 
+// ================================================================ storage
+
+/// Display name for a usage part (computed parts are translated, folder names kept).
+fn part_label(label: &str) -> String {
+    match label {
+        "Home" => tr("Thư mục Home", "Home"),
+        "Applications" => tr("Ứng dụng", "Applications"),
+        "Library" => tr("Thư viện hệ thống", "Library"),
+        "System & other" => tr("Hệ thống và khác", "System & other"),
+        "Free" => tr("Còn trống", "Free"),
+        "Other" => tr("Khác", "Other"),
+        "Files in Home" => tr("Tệp lẻ trong Home", "Files in Home"),
+        _ => label.to_string(),
+    }
+}
+
+fn storage_page(a: &App) -> Retained<NSView> {
+    let mtm = a.mtm;
+    let s = page_stack(mtm);
+    let scope = a.usage_scope.get();
+    let pie = a.usage_chart.get() == 0;
+    let usage = if scope == 0 { a.usage_home.borrow().clone() } else { a.usage_disk.borrow().clone() };
+
+    // Header controls: scope, chart form, measure.
+    let mut acc: Vec<Retained<NSView>> = vec![];
+    let scope_seg = segmented(mtm, &[&tr("Home", "Home"), &tr("Ổ đĩa", "Disk")], scope, &a.target(|_| {}));
+    let sr = scope_seg.clone();
+    let t = a.target(move |a| {
+        a.usage_scope.set(sr.selectedSegment());
+        a.request_render();
+    });
+    unsafe { scope_seg.setTarget(Some(&t)) };
+    acc.push(scope_seg.into_view());
+    let chart_seg = segmented(mtm, &[&tr("Tròn", "Pie"), &tr("Cột", "Columns")], a.usage_chart.get(), &a.target(|_| {}));
+    let cr = chart_seg.clone();
+    let t = a.target(move |a| {
+        a.usage_chart.set(cr.selectedSegment());
+        a.request_render();
+    });
+    unsafe { chart_seg.setTarget(Some(&t)) };
+    acc.push(chart_seg.into_view());
+    let status = label(mtm, "", &font(12.0, W::Regular), &Palette::secondary());
+    status.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    if a.usage_measuring.get() {
+        let h = hstack(mtm, 8.0);
+        let spin = NSProgressIndicator::new(mtm);
+        spin.setStyle(NSProgressIndicatorStyle::Spinning);
+        spin.setControlSize(NSControlSize::Small);
+        unsafe { spin.startAnimation(None) };
+        add(&h, &spin);
+        add(&h, &button(mtm, &tr("Dừng", "Stop"), &a.target(|a| a.stop_usage())));
+        acc.push(h.into_view());
+    } else {
+        let b = primary_button(mtm, &tr("Đo lại", "Measure again"), &a.target(|a| {
+            a.measure_usage();
+            a.request_render();
+        }));
+        with_symbol(&b, "arrow.clockwise");
+        acc.push(b.into_view());
+    }
+
+    let (c, inner) = card(mtm, 20.0, 12.0);
+    match &usage {
+        None => {
+            add(&inner, &label(mtm, &tr("Chưa có số liệu.", "No measurements yet."), &font(15.0, W::Semibold), &Palette::primary()));
+            add(&inner, &wrapping(mtm, &tr(
+                "Đo dung lượng từng thư mục trong Home có thể mất vài phút. Kết quả được lưu lại và tự đo lại sau 6 giờ khi bạn mở trang này.",
+                "Measuring every folder in Home can take a few minutes. Results are saved and re-measured after 6 hours when you open this page.",
+            ), &font(13.0, W::Regular), &Palette::secondary()));
+            if a.usage_measuring.get() {
+                add_full(&inner, &status);
+            }
+        }
+        Some(u) => {
+            let total_all = u.total().max(1);
+            let parts = if scope == 0 {
+                sdc_core::usage::fold(&u.parts, 8, &[])
+            } else {
+                sdc_core::usage::fold(&u.parts, 8, &["Free"])
+            };
+            let title = if scope == 0 {
+                format!("{} · {}", tr("Thư mục Home", "Home folder"), format::bytes(u.total()))
+            } else {
+                let name = a.volumes.borrow().first().map(|v| v.name.clone()).unwrap_or_else(|| "Disk".into());
+                format!("{name} · {}", format::bytes(u.total()))
+            };
+            let sub = if scope == 0 {
+                tr("Dung lượng từng thư mục ở cấp đầu của Home", "Space used by each top-level folder in Home")
+            } else {
+                tr("Dung lượng đã dùng chia theo khu vực, cộng phần còn trống", "Used space split by area, plus free space")
+            };
+            add_full(&inner, &card_title(mtm, "chart.pie.fill", &Palette::blue(), &title, Some(&sub), None));
+            if a.usage_measuring.get() {
+                add_full(&inner, &status);
+            }
+            // Colors follow the part: slot by position among named parts, neutral for Other/Free.
+            let mut slot = 0;
+            let colors: Vec<Retained<NSColor>> = parts
+                .iter()
+                .map(|p| match p.label.as_str() {
+                    "Other" => other_color(),
+                    "Free" => Palette::track(),
+                    _ => {
+                        let c = series_color(slot);
+                        slot += 1;
+                        c
+                    }
+                })
+                .collect();
+            let legend = vstack(mtm, 0.0);
+            for (i, (p, col)) in parts.iter().zip(&colors).enumerate() {
+                if i > 0 {
+                    add_full(&legend, &separator(mtm));
+                }
+                let pct = p.bytes as f64 * 100.0 / total_all as f64;
+                let (row, _) = value_row(mtm, if pie { Some(&**col) } else { None }, &part_label(&p.label), &format::bytes(p.bytes), Some(&format!("{pct:.1}%")));
+                if !p.path.is_empty() {
+                    let path = p.path.clone();
+                    let rv = link_button(mtm, &tr("Mở", "Reveal"), &Palette::blue(), &a.target(move |_| system::reveal(std::slice::from_ref(&path))));
+                    add(&row, &rv);
+                } else {
+                    let pad = NSView::new(mtm);
+                    size(&pad, 44.0, 1.0);
+                    add(&row, &pad);
+                }
+                add_full(&legend, &row);
+            }
+            if pie {
+                let row = hstack(mtm, 36.0);
+                row.setAlignment(NSLayoutAttribute::CenterY);
+                let chart = PieChart::new(mtm, 300.0, parts.iter().zip(&colors).map(|(p, c)| (p.bytes as f64, c.clone())).collect());
+                chart.setAccessibilityLabel(Some(&ns(&title)));
+                add(&row, &chart);
+                add(&row, &legend);
+                legend.widthAnchor().constraintGreaterThanOrEqualToConstant(360.0).setActive(true);
+                add_full(&inner, &row);
+            } else {
+                let bars = parts
+                    .iter()
+                    .filter(|p| p.label != "Free")
+                    .map(|p| (part_label(&p.label), p.bytes as f64, format::bytes(p.bytes)))
+                    .collect();
+                let chart = ColumnChart::new(mtm, 280.0, bars, &series_color(0));
+                chart.setAccessibilityLabel(Some(&ns(&title)));
+                add_full(&inner, &chart);
+                add_full(&inner, &separator(mtm));
+                add_full(&inner, &legend);
+            }
+            let when = chrono::DateTime::parse_from_rfc3339(&u.at)
+                .map(|t| t.with_timezone(&chrono::Local).format("%d/%m/%Y %H:%M").to_string())
+                .unwrap_or_default();
+            let icloud = a.settings.borrow().include_icloud;
+            let note = if scope == 0 && !icloud {
+                tr(
+                    &format!("Đo lúc {when}. Bỏ qua iCloud Drive, thư mục đám mây và ~/Library/Containers để macOS không hỏi quyền. Bật \"Đo cả iCloud Drive\" trong Cài đặt để tính cả iCloud."),
+                    &format!("Measured {when}. iCloud Drive, cloud folders and ~/Library/Containers are skipped so macOS doesn't ask for access. Turn on \"Include iCloud Drive in Storage\" in Settings to count iCloud."),
+                )
+            } else if scope == 0 {
+                tr(
+                    &format!("Đo lúc {when}. Có tính iCloud Drive; bỏ qua ~/Library/Containers và Group Containers."),
+                    &format!("Measured {when}. iCloud Drive included; ~/Library/Containers and Group Containers are skipped."),
+                )
+            } else {
+                tr(
+                    &format!("Đo lúc {when}. \"Hệ thống và khác\" là phần đã dùng ngoài Home, Ứng dụng và Thư viện: macOS, bản chụp, người dùng khác."),
+                    &format!("Measured {when}. \"System & other\" is used space outside Home, Applications and Library: macOS, snapshots, other users."),
+                )
+            };
+            add(&inner, &wrapping(mtm, &note, &font(12.0, W::Regular), &Palette::tertiary()));
+        }
+    }
+    add_full(&s, &c);
+    a.refs.borrow_mut().usage_status = Some(status);
+    let sc = scroller(mtm, &s);
+    frame(a, &tr("Dung lượng thư mục", "Storage"), &tr("Thư mục nào đang chiếm chỗ", "Which folders take up space"), acc, &sc)
+}
+
 // ================================================================ daily changes
 
 /// "+1.2 GB" / "−300 MB" / "0 B".
@@ -1388,11 +1809,12 @@ fn settings_page(a: &App) -> Retained<NSView> {
     add(&inner, &label(mtm, &tr("Quét và chạy nền", "Scanning and background"), &font(15.0, W::Semibold), &Palette::primary()));
     inner.setCustomSpacing_afterView(6.0, &inner.arrangedSubviews().lastObject().unwrap());
     type Toggle = (String, Option<String>, bool, fn(&mut Settings, bool));
-    let toggles: [Toggle; 4] = [
+    let toggles: [Toggle; 5] = [
         (tr("Tự động quét", "Auto scan"), Some(tr("Chỉ quét và thông báo, không tự xoá", "Scans and notifies only, never deletes")), d.auto_scan, |s, v| s.auto_scan = v),
         (tr("Mở khi đăng nhập", "Open at login"), None, d.open_at_login, |s, v| s.open_at_login = v),
         (tr("Đánh giá bằng Claude CLI", "Review with Claude CLI"), Some(tr("Chỉ gửi đường dẫn, kích thước, ngày", "Sends only paths, sizes and dates")), d.ai_review, |s, v| s.ai_review = v),
         (tr("Quét toàn bộ Home", "Scan all of Home"), Some(tr("Trừ các vùng được bảo vệ", "Except protected areas")), d.scan_home, |s, v| s.scan_home = v),
+        (tr("Đo cả iCloud Drive", "Include iCloud Drive in Storage"), Some(tr("macOS sẽ hỏi quyền truy cập · không bao giờ dọn", "macOS will ask for access · never cleaned")), d.include_icloud, |s, v| s.include_icloud = v),
     ];
     for (i, (title, note, on, set)) in toggles.into_iter().enumerate() {
         if i > 0 {
@@ -1484,6 +1906,35 @@ fn settings_page(a: &App) -> Retained<NSView> {
     with_symbol(&addb, "plus");
     add(&inner, &addb);
     add(&inner, &wrapping(mtm, &tr("Thư mục được bảo vệ (Library, iCloud, .git…) sẽ bị từ chối khi thêm.", "Protected folders (Library, iCloud, .git…) are refused."), &font(12.0, W::Regular), &Palette::tertiary()));
+    add_full(&inner, &separator(mtm));
+    add(&inner, &label(mtm, &tr("Thư mục riêng tư được phép đọc", "Private folders the app may read"), &font(13.0, W::Semibold), &Palette::primary()));
+    let pf = hstack(mtm, 16.0);
+    for f in PRIVATE_FOLDERS {
+        let name = match f {
+            "Desktop" => tr("Màn hình nền", "Desktop"),
+            "Documents" => tr("Tài liệu", "Documents"),
+            _ => tr("Tải về", "Downloads"),
+        };
+        let cb = unsafe { NSButton::checkboxWithTitle_target_action(&ns(&name), None, None, mtm) };
+        cb.setState(if d.private_folders.iter().any(|p| p == f) { NSControlStateValueOn } else { NSControlStateValueOff });
+        let cb_ref = cb.clone();
+        let t = a.target(move |a| {
+            let on = cb_ref.state() == NSControlStateValueOn;
+            a.edit_draft(|s| {
+                s.private_folders.retain(|p| p != f);
+                if on {
+                    s.private_folders.push(f.to_string());
+                }
+            });
+        });
+        unsafe {
+            cb.setTarget(Some(&t));
+            cb.setAction(Some(fire_sel()));
+        }
+        add(&pf, &cb);
+    }
+    add(&inner, &pf);
+    add(&inner, &wrapping(mtm, &tr("macOS chỉ hỏi quyền cho thư mục được chọn. Thư mục không chọn sẽ không bao giờ được mở, kể cả khi quét toàn bộ Home.", "macOS only asks about the folders ticked here. Unticked folders are never opened, even when scanning all of Home."), &font(12.0, W::Regular), &Palette::tertiary()));
     add(&row1, &c2);
     add_full(&s, &row1);
 
@@ -1532,6 +1983,7 @@ fn settings_page(a: &App) -> Retained<NSView> {
     add_full(&inner, &tsv);
     add(&row2, &c4);
     add_full(&s, &row2);
+    add_full(&s, &menu_bar_settings(a, &d));
     add(&s, &label(mtm, &tr("Vùng hệ thống và dữ liệu ứng dụng luôn được bảo vệ.", "System and app data always stay protected."), &font(12.0, W::Regular), &Palette::tertiary()));
     {
         let mut refs = a.refs.borrow_mut();
@@ -1548,6 +2000,79 @@ fn settings_page(a: &App) -> Retained<NSView> {
     acc.push(primary_button(mtm, &tr("Lưu cài đặt", "Save settings"), &a.target(|a| a.save_settings())).into_view());
     let sc = scroller(mtm, &s);
     frame(a, &tr("Cài đặt", "Settings"), &tr("Vùng hệ thống và dữ liệu ứng dụng luôn được bảo vệ", "System and app data always stay protected"), acc, &sc)
+}
+
+/// Settings card: what the menu bar item shows next to its dot.
+fn menu_bar_settings(a: &App, d: &Settings) -> Retained<NSBox> {
+    let mtm = a.mtm;
+    let (c, inner) = card(mtm, 18.0, 4.0);
+    add(&inner, &label(mtm, &tr("Thanh menu", "Menu bar"), &font(15.0, W::Semibold), &Palette::primary()));
+    add(&inner, &label(mtm, &tr("Chọn giá trị hiện cạnh chấm trạng thái", "Choose what shows next to the status dot"), &font(12.0, W::Regular), &Palette::secondary()));
+    let row = hstack(mtm, 18.0);
+    row.heightAnchor().constraintEqualToConstant(44.0).setActive(true);
+    for id in sdc_core::overview::MENU_BAR_ITEMS {
+        let name = match id {
+            "disk" => tr("Ổ trống", "Disk free"),
+            "temp" => tr("Tệp tạm", "Temporary"),
+            "cpu" => "CPU".to_string(),
+            _ => tr("Bộ nhớ", "Memory"),
+        };
+        let on = d.menu_bar_items.iter().any(|x| x == id);
+        let cb = unsafe { NSButton::checkboxWithTitle_target_action(&ns(&format!("{name} ({})", a.metric_text(id))), None, None, mtm) };
+        cb.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+        let cb_ref = cb.clone();
+        let t = a.target(move |a| {
+            let v = cb_ref.state() == NSControlStateValueOn;
+            a.edit_draft(|s| {
+                s.menu_bar_items.retain(|x| x != id);
+                if v {
+                    s.menu_bar_items.push(id.to_string());
+                }
+            });
+        });
+        unsafe {
+            cb.setTarget(Some(&t));
+            cb.setAction(Some(fire_sel()));
+        }
+        add(&row, &cb);
+    }
+    add_full(&inner, &row);
+    add_full(&inner, &separator(mtm));
+    let h = hstack(mtm, 8.0);
+    h.heightAnchor().constraintEqualToConstant(48.0).setActive(true);
+    add(&h, &label(mtm, &tr("Kiểu hiển thị", "Style"), &font(14.0, W::Regular), &Palette::primary()));
+    add(&h, &spacer(mtm));
+    let labels = [tr("Giá trị", "Values"), tr("Có nhãn", "Labels"), tr("Biểu tượng", "Icons")];
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let sel = sdc_core::overview::MENU_BAR_STYLES.iter().position(|x| *x == d.menu_bar_style).unwrap_or(0) as isize;
+    let seg = segmented(mtm, &refs, sel, &a.target(|_| {}));
+    let seg_ref = seg.clone();
+    let t = a.target(move |a| {
+        if let Some(st) = usize::try_from(seg_ref.selectedSegment()).ok().and_then(|i| sdc_core::overview::MENU_BAR_STYLES.get(i)) {
+            a.edit_draft(|s| s.menu_bar_style = st.to_string());
+        }
+    });
+    unsafe { seg.setTarget(Some(&t)) };
+    add(&h, &seg);
+    add_full(&inner, &h);
+    add_full(&inner, &separator(mtm));
+    let h = hstack(mtm, 8.0);
+    h.heightAnchor().constraintEqualToConstant(48.0).setActive(true);
+    let t = vstack(mtm, 2.0);
+    add(&t, &label(mtm, &tr("Chấm trạng thái", "Status dot"), &font(14.0, W::Regular), &Palette::primary()));
+    add(&t, &label(mtm, &tr("Xanh, vàng, đỏ theo dung lượng trống", "Green, yellow, red by free space"), &font(12.0, W::Regular), &Palette::secondary()));
+    add(&h, &t);
+    add(&h, &spacer(mtm));
+    let sw = switch(mtm, d.menu_bar_dot, &a.target(|_| {}));
+    let sw_ref = sw.clone();
+    let tg = a.target(move |a| {
+        let v = sw_ref.state() == NSControlStateValueOn;
+        a.edit_draft(|s| s.menu_bar_dot = v);
+    });
+    unsafe { sw.setTarget(Some(&tg)) };
+    add(&h, &sw);
+    add_full(&inner, &h);
+    c
 }
 
 // ================================================================ setup

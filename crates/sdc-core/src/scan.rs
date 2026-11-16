@@ -1,6 +1,6 @@
 //! Filesystem scan. Same skip rules as the Go `scan.go`.
 
-use crate::model::{clean, level, protected, Candidate, Safety, Settings, Volume};
+use crate::model::{clean, level, protected, within, Candidate, Safety, Settings, Volume};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -139,6 +139,7 @@ pub fn scan_with_progress(
     let cutoff = Utc::now() - Duration::days(s.min_age_days);
     let home_clean = clean(home);
     let mut folders: HashMap<String, i64> = HashMap::new();
+    let blocked = s.blocked_private(home);
 
     for root in roots {
         if cancel.load(Ordering::Relaxed) {
@@ -147,6 +148,11 @@ pub fn scan_with_progress(
         let root = clean(&root);
         progress.set_phase(format!("Scanning {}", short(&root, home)));
         progress.log(format!("▶ Scanning folder {}", short(&root, home)));
+        if blocked.iter().any(|b| within(&root, b)) {
+            result.skipped += 1;
+            progress.log(format!("  Skipped {} (no access: not allowed in Settings)", short(&root, home)));
+            continue;
+        }
         if (root != home_clean || !s.scan_home) && protected(&root, home, &s.exclusions) {
             result.skipped += 1;
             progress.log(format!("  Skipped {} (protected)", short(&root, home)));
@@ -187,6 +193,11 @@ pub fn scan_with_progress(
             let path = entry.path();
             let ft = entry.file_type();
             let depth = entry.depth();
+            if ft.is_dir() && blocked.iter().any(|b| b == path) {
+                it.skip_current_dir();
+                progress.log(format!("  Skipped {} (no access: not allowed in Settings)", short(path, home)));
+                continue;
+            }
             if path != root && protected(path, home, &s.exclusions) {
                 if ft.is_dir() {
                     it.skip_current_dir();

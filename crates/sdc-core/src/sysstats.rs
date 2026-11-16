@@ -364,3 +364,151 @@ pub fn machine_name() -> String {
     }
     "Mac".into()
 }
+
+// ---------- CPU, memory, temporary files ----------
+
+/// Total CPU load across all cores, from the difference between two samples.
+#[derive(Default)]
+pub struct CpuSampler {
+    prev: Option<(u64, u64)>,
+}
+
+#[allow(deprecated)] // libc points to the mach2 crate; these calls are stable.
+fn cpu_ticks() -> Option<(u64, u64)> {
+    let mut count: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut info_count: libc::mach_msg_type_number_t = 0;
+    let kr = unsafe {
+        libc::host_processor_info(
+            libc::mach_host_self(),
+            libc::PROCESSOR_CPU_LOAD_INFO,
+            &mut count,
+            &mut info,
+            &mut info_count,
+        )
+    };
+    if kr != 0 || info.is_null() {
+        return None;
+    }
+    let states = libc::CPU_STATE_MAX as usize;
+    let (mut busy, mut total) = (0u64, 0u64);
+    for cpu in 0..count as usize {
+        for state in 0..states {
+            let v = unsafe { *info.add(cpu * states + state) } as u32 as u64;
+            total += v;
+            if state != libc::CPU_STATE_IDLE as usize {
+                busy += v;
+            }
+        }
+    }
+    unsafe {
+        libc::vm_deallocate(
+            libc::mach_task_self(),
+            info as libc::vm_address_t,
+            (info_count as usize * std::mem::size_of::<libc::integer_t>()) as libc::vm_size_t,
+        );
+    }
+    Some((busy, total))
+}
+
+impl CpuSampler {
+    /// Load in percent (0–100) since the previous call; `None` on the first call.
+    pub fn sample(&mut self) -> Option<f64> {
+        let now = cpu_ticks()?;
+        let prev = self.prev.replace(now)?;
+        let total = now.1.saturating_sub(prev.1);
+        if total == 0 {
+            return Some(0.0);
+        }
+        Some(now.0.saturating_sub(prev.0) as f64 * 100.0 / total as f64)
+    }
+}
+
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let c = CString::new(name).ok()?;
+    let mut v: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let r = unsafe { libc::sysctlbyname(c.as_ptr(), &mut v as *mut u64 as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+    (r == 0).then_some(if len == 4 { v & 0xffff_ffff } else { v })
+}
+
+pub fn cpu_cores() -> usize {
+    sysctl_u64("hw.logicalcpu").unwrap_or(1) as usize
+}
+
+/// Memory split like Activity Monitor (bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MemInfo {
+    pub total: u64,
+    pub app: u64,
+    pub wired: u64,
+    pub compressed: u64,
+}
+
+impl MemInfo {
+    pub fn used(&self) -> u64 {
+        (self.app + self.wired + self.compressed).min(self.total)
+    }
+}
+
+#[allow(deprecated)]
+pub fn memory() -> Option<MemInfo> {
+    let total = sysctl_u64("hw.memsize")?;
+    let page = sysctl_u64("vm.pagesize").unwrap_or(16384);
+    let mut st: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let kr = unsafe {
+        libc::host_statistics64(libc::mach_host_self(), libc::HOST_VM_INFO64, &mut st as *mut _ as libc::host_info64_t, &mut count)
+    };
+    if kr != 0 {
+        return None;
+    }
+    let app = (st.internal_page_count as u64).saturating_sub(st.purgeable_count as u64) * page;
+    Some(MemInfo { total, app, wired: st.wire_count as u64 * page, compressed: st.compressor_page_count as u64 * page })
+}
+
+/// On-disk size of the usual temporary areas in the home folder (bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TempSizes {
+    pub caches: i64,
+    pub logs: i64,
+    pub trash: i64,
+}
+
+impl TempSizes {
+    pub fn total(&self) -> i64 {
+        self.caches + self.logs + self.trash
+    }
+}
+
+/// Sum of allocated blocks under `dir` (no symlinks, same volume, unreadable parts skipped).
+pub fn dir_size(dir: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(root) = std::fs::symlink_metadata(dir) else { return 0 };
+    let dev = root.dev();
+    let mut total = 0i64;
+    let mut it = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(entry) = entry else { continue };
+        let Ok(md) = entry.metadata() else { continue };
+        if md.dev() != dev {
+            if md.is_dir() {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+        if md.is_file() {
+            total += md.blocks() as i64 * 512;
+        }
+    }
+    total
+}
+
+/// Slow (walks the folders): call off the main thread.
+pub fn temp_sizes(home: &Path) -> TempSizes {
+    TempSizes {
+        caches: dir_size(&home.join("Library/Caches")),
+        logs: dir_size(&home.join("Library/Logs")),
+        trash: dir_size(&home.join(".Trash")),
+    }
+}

@@ -17,7 +17,9 @@ use sdc_core::scan::{scan_with_progress, volume_stats, Progress};
 use sdc_core::category::Category;
 use sdc_core::snapshot::Snapshot;
 use sdc_core::store::{ListInfo, Store};
-use sdc_core::sysstats::{self, DiskImage, Mount, ProcIo, ProcSampler, RateHistory};
+use sdc_core::usage::Usage;
+use sdc_core::overview::{normalize, CardPref, CardSize};
+use sdc_core::sysstats::{self, CpuSampler, DiskImage, MemInfo, Mount, ProcIo, ProcSampler, RateHistory, TempSizes};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,6 +59,8 @@ pub enum Page {
     Settings,
     /// Day-by-day disk usage changes.
     Changes,
+    /// Space used per folder (home / disk), as a pie or columns.
+    Storage,
     /// A user bookmark list.
     List(i64),
 }
@@ -71,7 +75,17 @@ pub struct Live {
     pub images: Vec<DiskImage>,
     pub mounts: Vec<Mount>,
     pub machine: String,
+    /// CPU load history in percent, oldest first (last 2 minutes).
+    pub cpu: std::collections::VecDeque<f64>,
+    pub cores: usize,
+    pub mem: Option<MemInfo>,
+    pub temp: Option<TempSizes>,
+    /// Bumped whenever `temp` is refreshed.
+    pub temp_rev: u64,
 }
+
+/// CPU samples kept (one per second).
+const CPU_HISTORY: usize = 120;
 
 pub struct NavItem {
     pub page: Page,
@@ -95,6 +109,17 @@ pub struct Refs {
     pub sel_buttons: Vec<Retained<NSButton>>,
     pub fields: Vec<Retained<NSTextField>>,
     pub exclusions: Option<Retained<NSTextView>>,
+    /// Overview live values: (label, hero size).
+    pub cpu_value: Option<(Retained<NSTextField>, f64)>,
+    pub cpu_spark: Option<Retained<Spark>>,
+    /// Average and peak labels of the large CPU card.
+    pub cpu_stats: Vec<Retained<NSTextField>>,
+    pub mem_value: Option<(Retained<NSTextField>, f64)>,
+    pub mem_bar: Option<Retained<Bar>>,
+    /// (part: 0 app, 1 wired, 2 compressed, 3 available; label, with name prefix)
+    pub mem_labels: Vec<(u8, Retained<NSTextField>, bool)>,
+    /// Storage page: "Measuring ~/Library…" while folder sizes are measured.
+    pub usage_status: Option<Retained<NSTextField>>,
 }
 
 pub struct App {
@@ -151,6 +176,22 @@ pub struct App {
     pruning: Cell<bool>,
     /// Snapshot index (newest = 0) whose changes the Daily changes page details.
     pub changes_day: Cell<usize>,
+    /// Overview is in "arrange cards" mode.
+    pub arranging: Cell<bool>,
+    ticks: Cell<u64>,
+    temp_seen: Cell<u64>,
+    /// Live value lines in the tray menu: (metric id, item).
+    pub tray_lines: RefCell<Vec<(&'static str, Retained<NSMenuItem>)>>,
+    /// Last folder-size measurements ("home" and "disk").
+    pub usage_home: RefCell<Option<Usage>>,
+    pub usage_disk: RefCell<Option<Usage>>,
+    /// Storage page: 0 = Home, 1 = Disk.
+    pub usage_scope: Cell<isize>,
+    /// Storage page: 0 = Pie, 1 = Columns.
+    pub usage_chart: Cell<isize>,
+    pub usage_measuring: Cell<bool>,
+    usage_progress: Arc<Mutex<String>>,
+    usage_cancel: Arc<AtomicBool>,
 }
 
 pub struct ScanOutcome {
@@ -170,6 +211,8 @@ impl App {
         let candidates = store.load_candidates()?;
         let lists = store.lists()?;
         let bookmark_index = store.bookmark_index()?;
+        let usage_home = store.load_usage("home").unwrap_or(None);
+        let usage_disk = store.load_usage("disk").unwrap_or(None);
         let a = Rc::new(App {
             mtm,
             home,
@@ -215,6 +258,17 @@ impl App {
             lists_box: RefCell::new(None),
             pruning: Cell::new(false),
             changes_day: Cell::new(0),
+            arranging: Cell::new(false),
+            ticks: Cell::new(0),
+            temp_seen: Cell::new(0),
+            tray_lines: RefCell::new(vec![]),
+            usage_home: RefCell::new(usage_home),
+            usage_disk: RefCell::new(usage_disk),
+            usage_scope: Cell::new(0),
+            usage_chart: Cell::new(0),
+            usage_measuring: Cell::new(false),
+            usage_progress: Arc::new(Mutex::new(String::new())),
+            usage_cancel: Arc::new(AtomicBool::new(false)),
         });
         APP.with(|cell| {
             let _ = cell.set(a.clone());
@@ -268,6 +322,9 @@ impl App {
         self.highlight_nav();
         if matches!(page, Page::Files | Page::Ignored | Page::List(_)) {
             self.prune_missing();
+        }
+        if page == Page::Storage && self.usage_stale() {
+            self.measure_usage();
         }
         self.request_render();
     }
@@ -358,10 +415,8 @@ impl App {
 
     pub fn update_tray(&self) {
         let Some(item) = self.status_item.borrow().clone() else { return };
-        if let Some(button) = item.button(self.mtm) {
-            button.setImage(Some(&system::tray_image(self.worst())));
-        }
         crate::pages::fill_tray_menu(self, &item);
+        self.update_tray_title();
     }
 
     // ------------------------------------------------------------ scanning
@@ -731,6 +786,215 @@ impl App {
         self.set_status(msg);
     }
 
+    // ------------------------------------------------------------ overview cards
+
+    pub fn cards(&self) -> Vec<CardPref> {
+        normalize(&self.settings.borrow().overview_cards)
+    }
+
+    fn save_cards(&self, cards: Vec<CardPref>) {
+        let mut s = self.settings.borrow().clone();
+        s.overview_cards = cards;
+        if let Err(e) = self.store.save_settings(&s) {
+            return self.set_status(e);
+        }
+        *self.settings.borrow_mut() = s;
+        self.request_render();
+    }
+
+    pub fn set_card_size(&self, id: &str, size: CardSize) {
+        let cards = self.cards().into_iter().map(|c| if c.id == id { CardPref { id: c.id, size } } else { c }).collect();
+        self.save_cards(cards);
+    }
+
+    pub fn move_card(&self, id: &str, step: isize) {
+        let mut cards = self.cards();
+        let Some(i) = cards.iter().position(|c| c.id == id) else { return };
+        let j = i as isize + step;
+        if j < 0 || j as usize >= cards.len() {
+            return;
+        }
+        cards.swap(i, j as usize);
+        self.save_cards(cards);
+    }
+
+    pub fn reset_cards(&self) {
+        self.save_cards(sdc_core::overview::default_cards());
+    }
+
+    /// Live snapshot of CPU/memory/temp values.
+    pub fn live_metrics(&self) -> (Vec<f64>, usize, Option<MemInfo>, Option<TempSizes>) {
+        match self.live.lock() {
+            Ok(l) => (l.cpu.iter().copied().collect(), l.cores, l.mem, l.temp),
+            Err(_) => (vec![], 0, None, None),
+        }
+    }
+
+    /// Short value for a metric: "147 GB", "6.8 GB", "23%", "11.6 GB".
+    pub fn metric_text(&self, id: &str) -> String {
+        let (cpu, _, mem, temp) = self.live_metrics();
+        match id {
+            "disk" => self.volumes.borrow().first().map(|v| format::bytes(v.free_bytes)).unwrap_or_else(|| "—".into()),
+            "temp" => temp.map(|t| format::bytes(t.total())).unwrap_or_else(|| "…".into()),
+            "cpu" => cpu.last().map(|v| format!("{v:.0}%")).unwrap_or_else(|| "—".into()),
+            "ram" => mem.map(|m| gib(m.used())).unwrap_or_else(|| "—".into()),
+            _ => String::new(),
+        }
+    }
+
+    /// Menu bar item: status dot plus the chosen values, and live tray menu lines.
+    pub fn update_tray_title(&self) {
+        let Some(item) = self.status_item.borrow().clone() else { return };
+        let Some(button) = item.button(self.mtm) else { return };
+        let s = self.settings.borrow().clone();
+        let items: Vec<&str> =
+            sdc_core::overview::MENU_BAR_ITEMS.iter().copied().filter(|id| s.menu_bar_items.iter().any(|x| x == id)).collect();
+        let dot = s.menu_bar_dot || items.is_empty();
+        button.setImage(if dot { Some(system::tray_image(self.worst())) } else { None }.as_deref());
+        button.setImagePosition(if items.is_empty() { NSCellImagePosition::ImageOnly } else { NSCellImagePosition::ImageLeading });
+        let font = digits(13.0, W::Regular);
+        if s.menu_bar_style == "icons" && !items.is_empty() {
+            button.setAttributedTitle(&system::icon_title(&items.iter().map(|id| (metric_symbol(id), self.metric_text(id))).collect::<Vec<_>>(), &font));
+        } else {
+            let text = match s.menu_bar_style.as_str() {
+                "labels" => items.iter().map(|id| format!("{} {}", metric_short_label(id), self.metric_text(id))).collect::<Vec<_>>().join("  "),
+                _ => items.iter().map(|id| self.metric_text(id)).collect::<Vec<_>>().join(" · "),
+            };
+            button.setFont(Some(&font));
+            button.setTitle(&ns(&text));
+        }
+        for (id, mi) in self.tray_lines.borrow().iter() {
+            mi.setTitle(&ns(&self.tray_line(id)));
+        }
+    }
+
+    /// One info line of the tray menu.
+    pub fn tray_line(&self, id: &str) -> String {
+        let (_, cores, mem, temp) = self.live_metrics();
+        match id {
+            "temp" => format!(
+                "{} · {}",
+                tr("Tệp tạm", "Temporary files"),
+                temp.map(|t| format::bytes(t.total())).unwrap_or_else(|| tr("đang đo…", "measuring…"))
+            ),
+            "cpu" => format!("CPU · {} · {} {}", self.metric_text("cpu"), cores, tr("nhân", "cores")),
+            "ram" => format!(
+                "{} · {}",
+                tr("Bộ nhớ", "Memory"),
+                mem.map(|m| format!("{} / {}", gib(m.used()), gib(m.total))).unwrap_or_else(|| "—".into())
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// Refresh the CPU and memory cards in place (no re-render).
+    pub fn update_live_cards(&self) {
+        let refs = self.refs.borrow();
+        if refs.cpu_value.is_none() && refs.mem_value.is_none() {
+            return;
+        }
+        let (cpu, _, mem, _) = self.live_metrics();
+        if let Some((l, size)) = refs.cpu_value.as_ref() {
+            let now = cpu.last().copied().unwrap_or(0.0);
+            set_hero_total(l, &format!("{now:.0}"), "%", "", *size);
+        }
+        if let Some(sp) = refs.cpu_spark.as_ref() {
+            sp.set_values(cpu.clone());
+        }
+        if refs.cpu_stats.len() == 2 && !cpu.is_empty() {
+            let avg = cpu.iter().sum::<f64>() / cpu.len() as f64;
+            let peak = cpu.iter().copied().fold(0.0, f64::max);
+            refs.cpu_stats[0].setStringValue(&ns(&format!("{avg:.0}%")));
+            refs.cpu_stats[1].setStringValue(&ns(&format!("{peak:.0}%")));
+        }
+        if let Some(m) = mem {
+            if let Some((l, size)) = refs.mem_value.as_ref() {
+                let used = gib(m.used());
+                let (n, u) = used.rsplit_once(' ').unwrap_or((&used, ""));
+                set_hero_total(l, n, u, &format!("/ {}", gib(m.total)), *size);
+            }
+            let t = m.total.max(1) as f64;
+            let (a, w, c) = (m.app as f64 / t, m.wired as f64 / t, m.compressed as f64 / t);
+            if let Some(b) = refs.mem_bar.as_ref() {
+                b.set_segments(mem_segments(a, w, c));
+            }
+            for (part, l, named) in &refs.mem_labels {
+                let (name, bytes) = match part {
+                    0 => (tr("Ứng dụng", "App"), m.app),
+                    1 => (tr("Cố định", "Wired"), m.wired),
+                    2 => (tr("Nén", "Compressed"), m.compressed),
+                    _ => (tr("Còn trống", "Available"), m.total.saturating_sub(m.used())),
+                };
+                l.setStringValue(&ns(&if *named { format!("{name} {}", gib(bytes)) } else { gib(bytes) }));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ folder usage
+
+    /// No measurement yet, or the last one is older than 6 hours.
+    fn usage_stale(&self) -> bool {
+        let at = self.usage_home.borrow().as_ref().map(|u| u.at.clone());
+        match at.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()) {
+            Some(t) => chrono::Utc::now() - t.with_timezone(&chrono::Utc) > chrono::Duration::hours(6),
+            None => true,
+        }
+    }
+
+    /// Measure folder sizes in the background (home first, then the disk split).
+    pub fn measure_usage(&self) {
+        if self.usage_measuring.replace(true) {
+            return;
+        }
+        self.usage_cancel.store(false, Ordering::Relaxed);
+        let home = self.home.clone();
+        let store = self.store.clone();
+        let progress = self.usage_progress.clone();
+        let cancel = self.usage_cancel.clone();
+        let vol = self.volumes.borrow().first().map(|v| (v.total_bytes, v.free_bytes));
+        let include_cloud = self.settings.borrow().include_icloud;
+        let blocked = self.settings.borrow().blocked_private(&self.home);
+        std::thread::spawn(move || {
+            let at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+            let report = |p: &str| {
+                if let Ok(mut g) = progress.lock() {
+                    *g = p.to_string();
+                }
+            };
+            let stop = || cancel.load(Ordering::Relaxed);
+            let home_u = sdc_core::usage::home_usage(&home, include_cloud, &blocked, &at, &report, &stop);
+            let disk_u = match (stop(), vol) {
+                (false, Some((total, free))) => {
+                    Some(sdc_core::usage::disk_usage(&home, home_u.total(), total, free, &at, &report, &stop))
+                }
+                _ => None,
+            };
+            let cancelled = stop();
+            if !cancelled {
+                let _ = store.save_usage("home", &home_u);
+                if let Some(d) = &disk_u {
+                    let _ = store.save_usage("disk", d);
+                }
+            }
+            later(move |a| {
+                a.usage_measuring.set(false);
+                if !cancelled {
+                    *a.usage_home.borrow_mut() = Some(home_u);
+                    if disk_u.is_some() {
+                        *a.usage_disk.borrow_mut() = disk_u;
+                    }
+                }
+                if a.page.get() == Page::Storage {
+                    a.request_render();
+                }
+            });
+        });
+    }
+
+    pub fn stop_usage(&self) {
+        self.usage_cancel.store(true, Ordering::Relaxed);
+    }
+
     // ------------------------------------------------------------ bookmark lists
 
     /// Reload lists and the bookmark index from the store and refresh the sidebar.
@@ -940,6 +1204,12 @@ impl App {
         if protected(Path::new(&path), &self.home, &d.exclusions) {
             return self.set_status(tr("Thư mục này được bảo vệ.", "This folder is protected."));
         }
+        // Picking a folder inside Desktop (etc.) is consent to read that folder.
+        if let Some(f) = Settings::private_folder_of(Path::new(&path), &self.home) {
+            if !d.private_folders.iter().any(|p| p == f) {
+                self.edit_draft(|d| d.private_folders.push(f.to_string()));
+            }
+        }
         if !d.roots.contains(&path) {
             self.edit_draft(|d| d.roots.push(path));
         }
@@ -1010,11 +1280,38 @@ impl App {
                 l.machine = machine;
             }
         });
+        // Temporary folder sizes: a walk, so on its own thread every 10 minutes.
+        let live = self.live.clone();
+        let home = self.home.clone();
+        std::thread::spawn(move || loop {
+            let t = sysstats::temp_sizes(&home);
+            if let Ok(mut l) = live.lock() {
+                l.temp = Some(t);
+                l.temp_rev += 1;
+            }
+            std::thread::sleep(Duration::from_secs(600));
+        });
         let live = self.live.clone();
         std::thread::spawn(move || {
             let mut procs = ProcSampler::default();
+            let mut cpu = CpuSampler::default();
+            let cores = sysstats::cpu_cores();
             let mut tick: u64 = 0;
             loop {
+                let load = cpu.sample();
+                let mem = if tick.is_multiple_of(2) { sysstats::memory() } else { None };
+                if let Ok(mut l) = live.lock() {
+                    l.cores = cores;
+                    if let Some(v) = load {
+                        l.cpu.push_back(v);
+                        while l.cpu.len() > CPU_HISTORY {
+                            l.cpu.pop_front();
+                        }
+                    }
+                    if mem.is_some() {
+                        l.mem = mem;
+                    }
+                }
                 let (r, w) = sysstats::disk_io_totals();
                 let p = if tick.is_multiple_of(2) { Some(procs.sample()) } else { None };
                 let extra = if tick.is_multiple_of(10) { Some((sysstats::disk_images(), sysstats::mounts())) } else { None };
@@ -1042,6 +1339,25 @@ impl App {
 
     /// 1 Hz: refresh live labels and charts on screen.
     pub fn tick(&self) {
+        if self.usage_measuring.get() {
+            if let Some(l) = self.refs.borrow().usage_status.as_ref() {
+                let p = self.usage_progress.lock().map(|p| p.clone()).unwrap_or_default();
+                l.setStringValue(&ns(&tr(&format!("Đang đo {p}…"), &format!("Measuring {p}…"))));
+            }
+        }
+        let n = self.ticks.get() + 1;
+        self.ticks.set(n);
+        self.update_live_cards();
+        if n.is_multiple_of(2) {
+            self.update_tray_title();
+        }
+        let temp_rev = self.live.lock().map(|l| l.temp_rev).unwrap_or(0);
+        if temp_rev != self.temp_seen.get() {
+            self.temp_seen.set(temp_rev);
+            if self.page.get() == Page::Overview {
+                self.request_render();
+            }
+        }
         let (latest, totals, buckets, procs) = {
             let Ok(l) = self.live.lock() else { return };
             let Some(h) = l.history.as_ref() else { return };
@@ -1163,5 +1479,36 @@ pub fn interval_text(minutes: i64) -> String {
         tr(&format!("{} giờ", minutes / 60), &format!("{} h", minutes / 60))
     } else {
         tr(&format!("{minutes} phút"), &format!("{minutes} min"))
+    }
+}
+
+/// Binary gigabytes, like Activity Monitor: "11.6 GB".
+pub fn gib(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+}
+
+pub fn mem_segments(app: f64, wired: f64, compressed: f64) -> Vec<(f64, f64, Retained<NSColor>)> {
+    vec![
+        (0.0, app, Palette::blue()),
+        (app, app + wired, Palette::indigo()),
+        (app + wired, app + wired + compressed, Palette::tint(&Palette::blue(), 0.45)),
+    ]
+}
+
+pub fn metric_symbol(id: &str) -> &'static str {
+    match id {
+        "disk" => "internaldrive",
+        "temp" => "clock.arrow.circlepath",
+        "cpu" => "cpu",
+        _ => "memorychip",
+    }
+}
+
+pub fn metric_short_label(id: &str) -> String {
+    match id {
+        "disk" => tr("Ổ", "Disk"),
+        "temp" => tr("Tạm", "Temp"),
+        "cpu" => "CPU".into(),
+        _ => "RAM".into(),
     }
 }

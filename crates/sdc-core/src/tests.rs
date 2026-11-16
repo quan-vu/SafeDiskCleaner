@@ -31,6 +31,9 @@ fn level_and_rules() {
         assert!(protected(Path::new(p), home, &excl), "not protected: {p}");
     }
     assert!(!protected(Path::new("/Users/test/Downloads/old.dmg"), home, &[]));
+    for p in ["/Users/test/iCloud Drive (Archive)/a.dmg", "/Users/test/Library/Mobile Documents/x", "/Volumes/X/CloudStorage/a"] {
+        assert!(protected(Path::new(p), home, &[]), "not protected: {p}");
+    }
 }
 
 #[test]
@@ -488,4 +491,132 @@ fn scan_reports_progress_and_log() {
     assert!(log.contains("Found") && log.contains("big.dmg"), "{log}");
     assert!(log.contains("git repository"), "{log}");
     assert!(p.take_log().is_empty(), "log drains");
+}
+
+#[test]
+fn overview_pack_and_normalize() {
+    use crate::overview::*;
+    let (p, rows) = pack(&[CardSize::L, CardSize::M, CardSize::S, CardSize::S], 4);
+    assert_eq!(rows, 2);
+    assert_eq!((p[0].col, p[0].row), (0, 0));
+    assert_eq!((p[1].col, p[1].row), (2, 0));
+    assert_eq!((p[2].col, p[2].row), (2, 1));
+    assert_eq!((p[3].col, p[3].row), (3, 1));
+    // An S first leaves a hole that a later S fills (dense placement).
+    let (p, rows) = pack(&[CardSize::S, CardSize::L, CardSize::L, CardSize::S], 4);
+    assert_eq!((p[1].col, p[2].col, p[2].row), (1, 0, 2));
+    assert_eq!((p[3].col, p[3].row), (3, 0));
+    assert_eq!(rows, 4);
+    let n = normalize(&[CardPref { id: "cpu".into(), size: CardSize::L }, CardPref { id: "bogus".into(), size: CardSize::S }, CardPref { id: "cpu".into(), size: CardSize::S }]);
+    assert_eq!(n.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["cpu", "disk", "temp", "ram"]);
+    assert_eq!(n[0].size, CardSize::L);
+}
+
+#[test]
+fn system_metrics_are_sane() {
+    use crate::sysstats::*;
+    let m = memory().expect("memory stats");
+    assert!(m.total > 0 && m.used() <= m.total);
+    assert!(cpu_cores() >= 1);
+    let mut c = CpuSampler::default();
+    assert!(c.sample().is_none());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let v = c.sample().expect("second sample");
+    assert!((0.0..=100.0).contains(&v));
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    std::fs::write(tmp.path().join("a"), vec![0u8; 8192]).unwrap();
+    assert!(dir_size(tmp.path()) >= 8192);
+    assert_eq!(dir_size(&tmp.path().join("missing")), 0);
+}
+
+#[test]
+fn folder_usage_measure_fold_store() {
+    use crate::usage::*;
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(home.join("Big/sub")).unwrap();
+    std::fs::write(home.join("Big/sub/a.bin"), vec![1u8; 200_000]).unwrap();
+    std::fs::create_dir_all(home.join("Small")).unwrap();
+    std::fs::write(home.join("Small/b.bin"), vec![1u8; 20_000]).unwrap();
+    std::fs::create_dir_all(home.join("Library/Containers/x")).unwrap();
+    std::fs::write(home.join("Library/Containers/x/c.bin"), vec![1u8; 500_000]).unwrap();
+    std::fs::write(home.join("Library/d.bin"), vec![1u8; 10_000]).unwrap();
+    std::fs::write(home.join("loose.txt"), vec![1u8; 5_000]).unwrap();
+    std::os::unix::fs::symlink(home.join("Big"), home.join("Link")).unwrap();
+    let seen = std::cell::RefCell::new(vec![]);
+    std::fs::create_dir_all(home.join("Library/Mobile Documents/com~apple~CloudDocs")).unwrap();
+    std::fs::write(home.join("Library/Mobile Documents/com~apple~CloudDocs/e.bin"), vec![1u8; 900_000]).unwrap();
+    std::fs::create_dir_all(home.join("iCloud Drive (Archive)")).unwrap();
+    std::fs::write(home.join("iCloud Drive (Archive)/f.bin"), vec![1u8; 300_000]).unwrap();
+    std::fs::create_dir_all(home.join("Desktop")).unwrap();
+    std::fs::write(home.join("Desktop/g.bin"), vec![1u8; 50_000]).unwrap();
+    let with_cloud = home_usage(&home, true, &[], "t", &|_| {}, &|| false);
+    assert!(with_cloud.parts.iter().any(|p| p.label == "Desktop"));
+    assert!(with_cloud.parts.iter().any(|p| p.label == "iCloud Drive (Archive)"));
+    let lib_cloud = with_cloud.parts.iter().find(|p| p.label == "Library").unwrap().bytes;
+    assert!(lib_cloud >= 900_000, "include_icloud walks Mobile Documents: {lib_cloud}");
+    let blocked = Settings::default_for(&home).blocked_private(&home);
+    assert_eq!(blocked, vec![home.join("Desktop")]);
+    let u = home_usage(&home, false, &blocked, "t", &|p| seen.borrow_mut().push(p.to_string()), &|| false);
+    assert!(!u.parts.iter().any(|p| p.label == "Desktop"), "Desktop is not opened by default");
+    assert!(!seen.borrow().iter().any(|p| p.contains("Desktop")));
+    assert!(!u.parts.iter().any(|p| p.label.starts_with("iCloud")), "iCloud folders skipped by default");
+    assert!(!seen.borrow().iter().any(|p| p.contains("iCloud")));
+    let labels: Vec<&str> = u.parts.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels[0], "Big");
+    assert!(labels.contains(&"Small") && labels.contains(&"Files in Home") && !labels.contains(&"Link"));
+    let lib = u.parts.iter().find(|p| p.label == "Library").unwrap();
+    assert!(lib.bytes < 100_000, "app containers are skipped: {}", lib.bytes);
+    assert!(seen.borrow().contains(&"~/Big".to_string()));
+
+    let d = disk_parts(&home, 3_000, 1_000, 500, 10_000, 4_000, "t");
+    let got: Vec<(&str, i64)> = d.parts.iter().map(|p| (p.label.as_str(), p.bytes)).collect();
+    assert_eq!(got, [("Home", 3_000), ("System & other", 1_500), ("Applications", 1_000), ("Library", 500), ("Free", 4_000)]);
+    assert_eq!(d.total(), 10_000);
+
+    let parts: Vec<Part> = (0..10).map(|i| Part { label: format!("p{i}"), path: String::new(), bytes: 100 - i }).collect();
+    let mut with_free = parts.clone();
+    with_free.push(Part { label: "Free".into(), path: String::new(), bytes: 1 });
+    let f = fold(&with_free, 8, &["Free"]);
+    assert_eq!(f.len(), 8);
+    assert_eq!(f[6].label, "Other");
+    assert_eq!(f[6].bytes, (91..=94).sum::<i64>(), "p6..p9 fold into Other");
+    assert_eq!(f[7].label, "Free");
+    assert_eq!(fold(&parts[..3], 8, &[]).len(), 3);
+
+    let store = Store::open(&home.join("db")).unwrap();
+    assert!(store.load_usage("home").unwrap().is_none());
+    store.save_usage("home", &u).unwrap();
+    assert_eq!(store.load_usage("home").unwrap().unwrap(), u);
+}
+
+#[test]
+fn scan_never_opens_disallowed_private_folders() {
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    for d in ["Desktop", "Documents", "Downloads"] {
+        std::fs::create_dir_all(home.join(d)).unwrap();
+        let f = home.join(d).join("old.dmg");
+        std::fs::write(&f, b"123456").unwrap();
+        filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    }
+    let mut s = Settings::default_for(&home);
+    s.scan_home = true;
+    s.min_size_bytes = 4;
+    let none = |_: &Path| None;
+    let p = crate::scan::Progress::default();
+    let r = crate::scan::scan_with_progress(&home, &s, Some(&none), &AtomicBool::new(false), &p).unwrap();
+    let mut found: Vec<String> = r.candidates.iter().map(|c| Path::new(&c.path).parent().unwrap().file_name().unwrap().to_string_lossy().into_owned()).collect();
+    found.sort();
+    assert_eq!(found, ["Documents", "Downloads"]);
+    assert!(p.take_log().join("\n").contains("Skipped ~/Desktop (no access"));
+    // A root inside a disallowed folder is skipped too.
+    s.scan_home = false;
+    s.roots = vec![home.join("Desktop").to_string_lossy().into_owned()];
+    let r = scan(&home, &s, Some(&none), &AtomicBool::new(false)).unwrap();
+    assert!(r.candidates.is_empty());
+    // Allowing it opens it.
+    s.private_folders.push("Desktop".into());
+    let r = scan(&home, &s, Some(&none), &AtomicBool::new(false)).unwrap();
+    assert_eq!(r.candidates.len(), 1);
 }

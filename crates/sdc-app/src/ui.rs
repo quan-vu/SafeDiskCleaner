@@ -136,6 +136,9 @@ impl Palette {
     pub fn blue() -> Retained<NSColor> {
         NSColor::systemBlueColor()
     }
+    pub fn brown() -> Retained<NSColor> {
+        NSColor::systemBrownColor()
+    }
     pub fn indigo() -> Retained<NSColor> {
         NSColor::systemIndigoColor()
     }
@@ -737,5 +740,364 @@ impl DotChart {
     pub fn set_samples(&self, s: Vec<Sample>) {
         *self.ivars().samples.borrow_mut() = s;
         self.setNeedsDisplay(true);
+    }
+}
+
+impl Bar {
+    pub fn set_segments(&self, segments: Vec<(f64, f64, Retained<NSColor>)>) {
+        *self.ivars().segments.borrow_mut() = segments;
+        self.setNeedsDisplay(true);
+    }
+}
+
+// ---------------------------------------------------------------- spark line
+
+pub struct SparkIvars {
+    /// Values in 0..=max, oldest first.
+    pub values: RefCell<Vec<f64>>,
+    pub max: Cell<f64>,
+    pub color: RefCell<Retained<NSColor>>,
+}
+
+define_class!(
+    /// Filled line chart for a short history (CPU load).
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SDCSpark"]
+    #[ivars = SparkIvars]
+    pub struct Spark;
+
+    impl Spark {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let b = self.bounds();
+            let values = self.ivars().values.borrow();
+            if values.len() < 2 {
+                return;
+            }
+            let max = self.ivars().max.get().max(1.0);
+            let step = b.size.width / (values.len() - 1) as f64;
+            let point = |i: usize, v: f64| {
+                NSPoint::new(b.origin.x + i as f64 * step, b.origin.y + 1.0 + (v / max).clamp(0.0, 1.0) * (b.size.height - 2.0))
+            };
+            let color = self.ivars().color.borrow();
+            let area = NSBezierPath::bezierPath();
+            area.moveToPoint(NSPoint::new(b.origin.x, b.origin.y));
+            for (i, v) in values.iter().enumerate() {
+                area.lineToPoint(point(i, *v));
+            }
+            area.lineToPoint(NSPoint::new(b.origin.x + b.size.width, b.origin.y));
+            area.closePath();
+            Palette::tint(&color, 0.16).setFill();
+            area.fill();
+            let line = NSBezierPath::bezierPath();
+            for (i, v) in values.iter().enumerate() {
+                if i == 0 {
+                    line.moveToPoint(point(i, *v));
+                } else {
+                    line.lineToPoint(point(i, *v));
+                }
+            }
+            line.setLineWidth(1.6);
+            line.setLineJoinStyle(NSLineJoinStyle::Round);
+            color.setStroke();
+            line.stroke();
+        }
+    }
+);
+
+impl Spark {
+    pub fn new(mtm: MainThreadMarker, height: f64, max: f64, color: &NSColor) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SparkIvars {
+            values: RefCell::new(vec![]),
+            max: Cell::new(max),
+            color: RefCell::new(color.retain()),
+        });
+        let v: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        v.heightAnchor().constraintEqualToConstant(height).setActive(true);
+        v
+    }
+
+    pub fn set_values(&self, values: Vec<f64>) {
+        *self.ivars().values.borrow_mut() = values;
+        self.setNeedsDisplay(true);
+    }
+}
+
+// ---------------------------------------------------------------- card grid
+
+/// A grid child: (view, col, row, cols, rows).
+pub type GridItem = (Retained<NSView>, usize, usize, usize, usize);
+
+pub struct GridIvars {
+    pub items: RefCell<Vec<GridItem>>,
+    pub columns: Cell<usize>,
+    pub row_height: Cell<f64>,
+    pub gap: Cell<f64>,
+}
+
+define_class!(
+    /// Places children on a column grid by (col, row, span); widths follow the view's width.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SDCCardGrid"]
+    #[ivars = GridIvars]
+    pub struct CardGrid;
+
+    impl CardGrid {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(layout))]
+        fn layout(&self) {
+            unsafe {
+                let _: () = msg_send![super(self), layout];
+            }
+            self.place();
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            unsafe {
+                let _: () = msg_send![super(self), setFrameSize: size];
+            }
+            self.place();
+        }
+    }
+);
+
+impl CardGrid {
+    pub fn new(mtm: MainThreadMarker, columns: usize, row_height: f64, gap: f64) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(GridIvars {
+            items: RefCell::new(vec![]),
+            columns: Cell::new(columns.max(1)),
+            row_height: Cell::new(row_height),
+            gap: Cell::new(gap),
+        });
+        let v: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        v
+    }
+
+    /// Add a child at a grid cell; `rows_total` sets the grid's height.
+    pub fn put(&self, view: &NSView, col: usize, row: usize, cols: usize, rows: usize) {
+        view.setTranslatesAutoresizingMaskIntoConstraints(true);
+        self.addSubview(view);
+        self.ivars().items.borrow_mut().push((view.retain(), col, row, cols, rows));
+    }
+
+    pub fn set_rows(&self, rows: usize) {
+        let h = self.ivars().row_height.get();
+        let g = self.ivars().gap.get();
+        let total = if rows == 0 { 0.0 } else { rows as f64 * h + (rows - 1) as f64 * g };
+        self.heightAnchor().constraintEqualToConstant(total).setActive(true);
+    }
+
+    fn place(&self) {
+        let w = self.bounds().size.width;
+        let n = self.ivars().columns.get() as f64;
+        let g = self.ivars().gap.get();
+        let h = self.ivars().row_height.get();
+        let cell = ((w - g * (n - 1.0)) / n).max(0.0);
+        for (v, col, row, cols, rows) in self.ivars().items.borrow().iter() {
+            let x = *col as f64 * (cell + g);
+            let y = *row as f64 * (h + g);
+            let width = *cols as f64 * cell + (*cols as f64 - 1.0) * g;
+            let height = *rows as f64 * h + (*rows as f64 - 1.0) * g;
+            v.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)));
+        }
+    }
+}
+
+/// Hero number with a unit and a smaller trailing total: "147 GB / 494 GB".
+pub fn set_hero_total(l: &NSTextField, number: &str, unit: &str, total: &str, size: f64) {
+    let s = NSMutableAttributedString::new();
+    let part = |text: &str, f: Retained<NSFont>, c: Retained<NSColor>| unsafe {
+        let attrs = NSDictionary::<NSAttributedStringKey, AnyObject>::from_slices(
+            &[NSFontAttributeName, NSForegroundColorAttributeName],
+            &[&*f as &AnyObject, &*c as &AnyObject],
+        );
+        s.appendAttributedString(&NSAttributedString::initWithString_attributes(NSAttributedString::alloc(), &ns(text), Some(&attrs)));
+    };
+    part(number, digits(size, W::Semibold), Palette::primary());
+    if !unit.is_empty() {
+        part(&format!(" {unit}"), font((size * 0.42).round(), W::Medium), Palette::secondary());
+    }
+    if !total.is_empty() {
+        part(&format!("  {total}"), digits((size * 0.36).round().max(12.0), W::Medium), Palette::secondary());
+    }
+    l.setAttributedStringValue(&s);
+}
+
+pub fn hero_total(mtm: MainThreadMarker, number: &str, unit: &str, total: &str, size: f64) -> Retained<NSTextField> {
+    let l = label(mtm, "", &font(size, W::Semibold), &Palette::primary());
+    set_hero_total(&l, number, unit, total, size);
+    l
+}
+
+// ---------------------------------------------------------------- charts
+
+/// Categorical slots (light, dark) in fixed order: blue, orange, aqua, yellow,
+/// magenta, green, violet, red. A 9th part never gets a new hue: fold to "Other".
+const SERIES: [(u32, u32); 8] = [
+    (0x2a78d6, 0x3987e5),
+    (0xeb6834, 0xd95926),
+    (0x1baf7a, 0x199e70),
+    (0xeda100, 0xc98500),
+    (0xe87ba4, 0xd55181),
+    (0x008300, 0x0ca30c),
+    (0x6250d6, 0x9085e9),
+    (0xe34948, 0xe66767),
+];
+
+pub fn series_color(i: usize) -> Retained<NSColor> {
+    let (l, d) = SERIES[i % SERIES.len()];
+    dyn_color(l, d)
+}
+
+/// Neutral for "Other".
+pub fn other_color() -> Retained<NSColor> {
+    dyn_color(0x9a9893, 0x6f6e69)
+}
+
+fn text_attrs(f: &NSFont, c: &NSColor) -> Retained<NSDictionary<NSAttributedStringKey, AnyObject>> {
+    unsafe { NSDictionary::from_slices(&[NSFontAttributeName, NSForegroundColorAttributeName], &[f as &AnyObject, c as &AnyObject]) }
+}
+
+pub struct PieIvars {
+    /// (value, color), drawn clockwise from 12 o'clock.
+    pub slices: RefCell<Vec<(f64, Retained<NSColor>)>>,
+}
+
+define_class!(
+    /// Pie chart with a thin surface-colored gap between slices.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SDCPie"]
+    #[ivars = PieIvars]
+    pub struct PieChart;
+
+    impl PieChart {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let b = self.bounds();
+            let slices = self.ivars().slices.borrow();
+            let total: f64 = slices.iter().map(|s| s.0.max(0.0)).sum();
+            if total <= 0.0 {
+                return;
+            }
+            let r = (b.size.width.min(b.size.height) / 2.0 - 2.0).max(1.0);
+            let center = NSPoint::new(b.origin.x + b.size.width / 2.0, b.origin.y + b.size.height / 2.0);
+            let mut angle = 90.0;
+            let visible = slices.iter().filter(|s| s.0 > 0.0).count();
+            for (v, color) in slices.iter() {
+                if *v <= 0.0 {
+                    continue;
+                }
+                let sweep = v / total * 360.0;
+                let path = NSBezierPath::bezierPath();
+                if visible == 1 {
+                    path.appendBezierPathWithOvalInRect(NSRect::new(NSPoint::new(center.x - r, center.y - r), NSSize::new(2.0 * r, 2.0 * r)));
+                } else {
+                    path.moveToPoint(center);
+                    path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(center, r, angle, angle - sweep, true);
+                    path.closePath();
+                }
+                color.setFill();
+                path.fill();
+                if visible > 1 {
+                    Palette::card().setStroke();
+                    path.setLineWidth(2.0);
+                    path.setLineJoinStyle(NSLineJoinStyle::Round);
+                    path.stroke();
+                }
+                angle -= sweep;
+            }
+        }
+    }
+);
+
+impl PieChart {
+    pub fn new(mtm: MainThreadMarker, side: f64, slices: Vec<(f64, Retained<NSColor>)>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(PieIvars { slices: RefCell::new(slices) });
+        let v: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        size(&v, side, side);
+        v
+    }
+}
+
+pub struct ColumnIvars {
+    /// (label, value, value text)
+    pub bars: RefCell<Vec<(String, f64, String)>>,
+    pub color: Retained<NSColor>,
+}
+
+define_class!(
+    /// Ranked columns in one hue: value above, name below, 4px rounded tops on a baseline.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SDCColumns"]
+    #[ivars = ColumnIvars]
+    pub struct ColumnChart;
+
+    impl ColumnChart {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let b = self.bounds();
+            let bars = self.ivars().bars.borrow();
+            if bars.is_empty() {
+                return;
+            }
+            let max = bars.iter().map(|x| x.1).fold(0.0, f64::max).max(1.0);
+            let (label_h, value_h) = (34.0, 20.0);
+            let base = b.origin.y + label_h;
+            let plot_h = (b.size.height - label_h - value_h).max(1.0);
+            let slot = b.size.width / bars.len() as f64;
+            let bw = (slot * 0.62).min(64.0);
+            let label_font = font(11.0, W::Regular);
+            let value_font = digits(11.0, W::Semibold);
+            let label_attrs = text_attrs(&label_font, &Palette::secondary());
+            let value_attrs = text_attrs(&value_font, &Palette::primary());
+            for (i, (name, v, text)) in bars.iter().enumerate() {
+                let h = (v / max * plot_h).max(if *v > 0.0 { 2.0 } else { 0.0 });
+                let x = b.origin.x + slot * i as f64 + (slot - bw) / 2.0;
+                let rect = NSRect::new(NSPoint::new(x, base), NSSize::new(bw, h));
+                self.ivars().color.setFill();
+                // Rounded data end, square base anchored to the baseline.
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 4.0_f64.min(h / 2.0), 4.0_f64.min(h / 2.0)).fill();
+                NSBezierPath::fillRect(NSRect::new(NSPoint::new(x, base), NSSize::new(bw, (h / 2.0).min(4.0))));
+                let draw_centered = |s: &str, attrs: &NSDictionary<NSAttributedStringKey, AnyObject>, y: f64| {
+                    let mut text = s.to_string();
+                    let ns_text = |t: &str| ns(t);
+                    let mut w = unsafe { ns_text(&text).sizeWithAttributes(Some(attrs)) }.width;
+                    while w > slot - 4.0 && text.chars().count() > 2 {
+                        let mut chars: Vec<char> = text.trim_end_matches('…').chars().collect();
+                        chars.pop();
+                        text = chars.into_iter().collect::<String>() + "…";
+                        w = unsafe { ns_text(&text).sizeWithAttributes(Some(attrs)) }.width;
+                    }
+                    let cx = b.origin.x + slot * i as f64 + (slot - w) / 2.0;
+                    unsafe { ns_text(&text).drawAtPoint_withAttributes(NSPoint::new(cx, y), Some(attrs)) };
+                };
+                draw_centered(text, &value_attrs, base + h + 4.0);
+                draw_centered(name, &label_attrs, b.origin.y + 12.0);
+            }
+            Palette::hairline().setFill();
+            NSBezierPath::fillRect(NSRect::new(NSPoint::new(b.origin.x, base - 1.0), NSSize::new(b.size.width, 1.0)));
+        }
+    }
+);
+
+impl ColumnChart {
+    pub fn new(mtm: MainThreadMarker, height: f64, bars: Vec<(String, f64, String)>, color: &NSColor) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ColumnIvars { bars: RefCell::new(bars), color: color.retain() });
+        let v: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        v.heightAnchor().constraintEqualToConstant(height).setActive(true);
+        v
     }
 }

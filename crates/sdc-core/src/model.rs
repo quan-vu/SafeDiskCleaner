@@ -26,6 +26,26 @@ fn default_time() -> DateTime<Utc> {
 
 pub const DEFAULT_SCAN_INTERVAL_MINUTES: i64 = 10;
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_menu_items() -> Vec<String> {
+    vec!["disk".into()]
+}
+
+/// Home folders macOS guards with a privacy prompt. The app only reads the ones
+/// listed in `Settings::private_folders`.
+pub const PRIVATE_FOLDERS: [&str; 3] = ["Desktop", "Documents", "Downloads"];
+
+fn default_private_folders() -> Vec<String> {
+    vec!["Documents".into(), "Downloads".into()]
+}
+
+fn default_menu_style() -> String {
+    "compact".into()
+}
+
 fn default_interval() -> i64 {
     DEFAULT_SCAN_INTERVAL_MINUTES
 }
@@ -47,6 +67,23 @@ pub struct Settings {
     /// Minutes between automatic scans.
     #[serde(default = "default_interval")]
     pub scan_interval_minutes: i64,
+    /// Overview cards in display order with their size.
+    #[serde(default = "crate::overview::default_cards")]
+    pub overview_cards: Vec<crate::overview::CardPref>,
+    /// Values shown next to the menu bar dot: "disk", "temp", "cpu", "ram".
+    #[serde(default = "default_menu_items")]
+    pub menu_bar_items: Vec<String>,
+    /// "compact" (values), "labels" or "icons".
+    #[serde(default = "default_menu_style")]
+    pub menu_bar_style: String,
+    #[serde(default = "default_true")]
+    pub menu_bar_dot: bool,
+    /// Storage page also measures iCloud Drive and cloud folders (macOS asks for access). Off by default.
+    #[serde(default)]
+    pub include_icloud: bool,
+    /// Privacy-guarded home folders the app may read (others are never opened, so macOS never asks).
+    #[serde(default = "default_private_folders")]
+    pub private_folders: Vec<String>,
     #[serde(default, deserialize_with = "null_vec")]
     pub roots: Vec<String>,
     #[serde(default, deserialize_with = "null_vec")]
@@ -74,7 +111,16 @@ impl Settings {
             scan_home: false,
             ai_review: false,
             scan_interval_minutes: DEFAULT_SCAN_INTERVAL_MINUTES,
-            roots: vec![home.join("Downloads").to_string_lossy().into_owned()],
+            overview_cards: crate::overview::default_cards(),
+            menu_bar_items: default_menu_items(),
+            menu_bar_style: default_menu_style(),
+            menu_bar_dot: true,
+            include_icloud: false,
+            private_folders: default_private_folders(),
+            roots: vec![
+                home.join("Downloads").to_string_lossy().into_owned(),
+                home.join("Documents").to_string_lossy().into_owned(),
+            ],
             exclusions: vec![],
             min_size_bytes: 500 * MB,
             min_age_days: 90,
@@ -103,6 +149,16 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// Privacy-guarded home folders the app must not open.
+    pub fn blocked_private(&self, home: &Path) -> Vec<PathBuf> {
+        PRIVATE_FOLDERS.iter().filter(|f| !self.private_folders.iter().any(|p| p == *f)).map(|f| home.join(f)).collect()
+    }
+
+    /// The privacy-guarded home folder `path` lies in, if any ("Desktop"…).
+    pub fn private_folder_of(path: &Path, home: &Path) -> Option<&'static str> {
+        PRIVATE_FOLDERS.iter().copied().find(|f| within(path, &home.join(f)))
     }
 
     /// Roots actually scanned: home when `scan_home`, else the selected folders.
@@ -260,7 +316,12 @@ pub fn protected(path: &Path, home: &Path, exclusions: &[String]) -> bool {
         if s.starts_with('.') {
             return true;
         }
-        if lower.starts_with("onedrive") || lower.starts_with("dropbox") || lower.starts_with("google drive") {
+        if lower.starts_with("onedrive")
+            || lower.starts_with("dropbox")
+            || lower.starts_with("google drive")
+            || lower.starts_with("icloud")
+            || lower == "cloudstorage"
+        {
             return true;
         }
         if PROTECTED_SUFFIXES.iter().any(|x| lower.ends_with(x)) {

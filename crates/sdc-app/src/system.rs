@@ -4,7 +4,7 @@ use crate::ui::ns;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
-use objc2::MainThreadMarker;
+use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::*;
 use objc2_foundation::*;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
@@ -123,4 +123,30 @@ pub fn preferred_vietnamese() -> bool {
 
 pub fn _mtm() -> MainThreadMarker {
     MainThreadMarker::new().expect("main thread")
+}
+
+/// Menu bar title with an SF Symbol before each value; symbols follow the text color.
+pub fn icon_title(parts: &[(&str, String)], font: &NSFont) -> Retained<NSAttributedString> {
+    let out = NSMutableAttributedString::new();
+    let attrs = unsafe {
+        NSDictionary::<NSAttributedStringKey, objc2::runtime::AnyObject>::from_slices(
+            &[NSFontAttributeName, NSForegroundColorAttributeName],
+            &[font as &objc2::runtime::AnyObject, &*NSColor::labelColor() as &objc2::runtime::AnyObject],
+        )
+    };
+    for (i, (symbol, value)) in parts.iter().enumerate() {
+        if let Some(img) = crate::ui::symbol(symbol, 12.0, crate::ui::W::Regular) {
+            img.setTemplate(true);
+            let att = NSTextAttachment::new();
+            att.setImage(Some(&img));
+            let s = NSAttributedString::attributedStringWithAttachment(&att);
+            let m = NSMutableAttributedString::initWithAttributedString(NSMutableAttributedString::alloc(), &s);
+            unsafe { m.addAttributes_range(&attrs, NSRange::new(0, m.length())) };
+            out.appendAttributedString(&m);
+        }
+        let text = format!(" {value}{}", if i + 1 < parts.len() { "   " } else { "" });
+        let piece = unsafe { NSAttributedString::initWithString_attributes(NSAttributedString::alloc(), &ns(&text), Some(&attrs)) };
+        out.appendAttributedString(&piece);
+    }
+    out.into_super()
 }

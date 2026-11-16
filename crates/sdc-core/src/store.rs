@@ -78,6 +78,15 @@ impl Store {
             )
             .map_err(e)?;
         }
+        if version < 3 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS usage (scope TEXT PRIMARY KEY, json TEXT NOT NULL);
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )
+            .map_err(e)?;
+        }
         Ok(Store { db: Mutex::new(db) })
     }
 
@@ -327,5 +336,27 @@ impl Store {
             out.push(serde_json::from_str(&json.map_err(e)?).map_err(e)?);
         }
         Ok(out)
+    }
+
+    // ------------------------------------------------------------ folder usage
+
+    pub fn save_usage(&self, scope: &str, usage: &crate::usage::Usage) -> Res<()> {
+        let json = serde_json::to_string(usage).map_err(e)?;
+        self.conn()
+            .execute(
+                "INSERT INTO usage(scope, json) VALUES(?1, ?2) ON CONFLICT(scope) DO UPDATE SET json=excluded.json",
+                params![scope, json],
+            )
+            .map_err(e)?;
+        Ok(())
+    }
+
+    pub fn load_usage(&self, scope: &str) -> Res<Option<crate::usage::Usage>> {
+        let json: Option<String> = self
+            .conn()
+            .query_row("SELECT json FROM usage WHERE scope=?1", params![scope], |r| r.get(0))
+            .optional()
+            .map_err(e)?;
+        json.map(|j| serde_json::from_str(&j).map_err(e)).transpose()
     }
 }
