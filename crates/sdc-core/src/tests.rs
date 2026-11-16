@@ -296,3 +296,196 @@ fn live_counters_are_readable() {
     }
     assert!(!crate::sysstats::mounts().is_empty());
 }
+
+fn sample(id: &str, path: &str, size: i64) -> Candidate {
+    Candidate {
+        id: id.into(),
+        path: path.into(),
+        size,
+        modified_at: zero_time(),
+        last_used_at: zero_time(),
+        last_use_known: false,
+        device: 1,
+        inode: 2,
+        safety: Safety::Review,
+        reason: "fresh".into(),
+        ignored: false,
+    }
+}
+
+#[test]
+fn settings_default_interval() {
+    let home = Path::new("/Users/test");
+    let mut v = serde_json::to_value(Settings::default_for(home)).unwrap();
+    v.as_object_mut().unwrap().remove("scanIntervalMinutes");
+    let s: Settings = serde_json::from_value(v).unwrap();
+    assert_eq!(s.scan_interval_minutes, 10);
+    let mut bad = s.clone();
+    bad.scan_interval_minutes = 0;
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn lists_seeded_once_and_bookmarks() {
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let lists = store.lists().unwrap();
+    assert_eq!(lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["App Large Files", "Document Large Files"]);
+    store.delete_list(lists[1].id).unwrap();
+    drop(store);
+    let store = Store::open(tmp.path()).unwrap();
+    assert_eq!(store.lists().unwrap().len(), 1, "defaults must not be reseeded");
+
+    let app = store.lists().unwrap()[0].id;
+    let docs = store.create_list("Docs").unwrap();
+    assert!(store.create_list(" Docs ").is_err());
+    assert!(store.create_list("  ").is_err());
+    let a = sample("1:1", "/x/a.dmg", 5);
+    let b = sample("1:2", "/x/b.pdf", 7);
+    store.add_bookmarks(app, &[a.clone(), b.clone()], "t1").unwrap();
+    store.add_bookmarks(app, std::slice::from_ref(&a), "t2").unwrap();
+    store.add_bookmarks(docs, std::slice::from_ref(&b), "t1").unwrap();
+    assert_eq!(store.bookmarks(app).unwrap().len(), 2);
+    assert_eq!(store.bookmark_index().unwrap()["1:2"], vec!["App Large Files".to_string(), "Docs".to_string()]);
+    store.remove_bookmarks(app, &["1:1".into()]).unwrap();
+    assert_eq!(store.bookmarks(app).unwrap(), vec![b.clone()]);
+    store.remove_bookmarks_for_files(&["1:2".into()]).unwrap();
+    assert!(store.bookmarks(app).unwrap().is_empty());
+    assert!(store.bookmarks(docs).unwrap().is_empty());
+    store.add_bookmarks(docs, &[a], "t3").unwrap();
+    store.rename_list(docs, "Papers").unwrap();
+    store.delete_list(docs).unwrap();
+    assert!(store.all_bookmarks().unwrap().is_empty(), "delete cascades");
+}
+
+#[test]
+fn categories() {
+    use crate::category::Category;
+    assert_eq!(Category::of(Path::new("/a/Xcode.XIP")), Category::App);
+    assert_eq!(Category::of(Path::new("/a/setup.dmg")), Category::App);
+    assert_eq!(Category::of(Path::new("/a/report.pdf")), Category::Document);
+    assert_eq!(Category::of(Path::new("/a/clip.mov")), Category::Video);
+    assert_eq!(Category::of(Path::new("/a/backup.tar.gz")), Category::Archive);
+    assert_eq!(Category::of(Path::new("/a/noext")), Category::Other);
+}
+
+#[test]
+fn still_exists_checks_identity() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let p = tmp.path().join("f.bin");
+    std::fs::write(&p, b"x").unwrap();
+    let md = std::fs::metadata(&p).unwrap();
+    let mut c = sample("x", p.to_str().unwrap(), 1);
+    c.device = md.dev() as u64;
+    c.inode = md.ino();
+    assert!(still_exists(&c));
+    std::fs::remove_file(&p).unwrap();
+    assert!(!still_exists(&c));
+}
+
+#[test]
+fn carry_over_keeps_unchanged_verdicts() {
+    let mut reviewed = sample("a", "/x/a", 10);
+    reviewed.safety = Safety::Safe;
+    reviewed.reason = "installer, safe".into();
+    let never = sample("b", "/x/b", 10);
+    let mut changed = sample("c", "/x/c", 10);
+    changed.reason = "old verdict".into();
+    let before = vec![reviewed, never, changed];
+    let mut after = vec![sample("a", "/x/a", 10), sample("b", "/x/b", 10), sample("c", "/x/c", 11), sample("d", "/x/d", 1)];
+    let todo = carry_over(&before, &mut after);
+    assert_eq!(todo, vec![1, 2, 3]);
+    assert_eq!(after[0].safety, Safety::Safe);
+    assert_eq!(after[0].reason, "installer, safe");
+    assert_eq!(after[2].reason, "fresh");
+}
+
+#[test]
+fn snapshots_compare_and_store() {
+    use crate::snapshot::{compare, Snapshot};
+    let vol = |free| Volume {
+        path: "/".into(),
+        name: "Macintosh HD".into(),
+        device: 1,
+        free_bytes: free,
+        total_bytes: 100,
+        fs_type: "APFS".into(),
+        bsd_name: "disk3s1".into(),
+        level: Level::Green,
+    };
+    let s1 = Snapshot::new(
+        "2026-11-15",
+        "t",
+        &[vol(60)],
+        &[("/d/A".into(), 10), ("/d/B".into(), 5)],
+        &[sample("1", "/d/A/old.dmg", 9)],
+    );
+    let s2 = Snapshot::new(
+        "2026-11-16",
+        "t",
+        &[vol(40)],
+        &[("/d/A".into(), 30), ("/d/C".into(), 1)],
+        &[sample("2", "/d/A/new.mov", 20)],
+    );
+    let c = compare(&s1, &s2);
+    assert_eq!(c.used_delta, 20);
+    assert_eq!(c.folders, vec![("/d/A".into(), 10, 30), ("/d/B".into(), 5, 0), ("/d/C".into(), 0, 1)]);
+    assert_eq!(c.new_files[0].id, "2");
+    assert_eq!(c.gone_files[0].id, "1");
+
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    store.save_snapshot(&s1, 2).unwrap();
+    store.save_snapshot(&s2, 2).unwrap();
+    store.save_snapshot(&s2, 2).unwrap();
+    let mut s3 = s2.clone();
+    s3.day = "2026-11-17".into();
+    store.save_snapshot(&s3, 2).unwrap();
+    let days: Vec<String> = store.snapshots(10).unwrap().into_iter().map(|s| s.day).collect();
+    assert_eq!(days, ["2026-11-17", "2026-11-16"]);
+}
+
+#[test]
+fn scan_reports_folder_sizes() {
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    let root = home.join("Downloads");
+    std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+    std::fs::write(root.join("sub/deep/a.bin"), vec![1u8; 10_000]).unwrap();
+    std::fs::write(root.join("top.bin"), vec![1u8; 10_000]).unwrap();
+    let s = Settings::default_for(&home);
+    let none = |_: &Path| None;
+    let r = scan(&home, &s, Some(&none), &AtomicBool::new(false)).unwrap();
+    let get = |p: &Path| r.folder_sizes.iter().find(|(k, _)| Path::new(k) == p).map(|(_, v)| *v).unwrap_or(0);
+    assert!(get(&root.join("sub")) >= 10_000, "{:?}", r.folder_sizes);
+    assert!(get(&root) >= 10_000, "{:?}", r.folder_sizes);
+}
+
+#[test]
+fn scan_reports_progress_and_log() {
+    use crate::scan::{scan_with_progress, Progress};
+    use std::sync::atomic::Ordering;
+    let tmp = tempfile::Builder::new().prefix("sdc").tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    let root = home.join("Downloads");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/big.dmg"), b"123456").unwrap();
+    filetime::set_file_mtime(root.join("sub/big.dmg"), filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+    let mut s = Settings::default_for(&home);
+    s.min_size_bytes = 4;
+    let none = |_: &Path| None;
+    let p = Progress::default();
+    let r = scan_with_progress(&home, &s, Some(&none), &AtomicBool::new(false), &p).unwrap();
+    assert_eq!(r.candidates.len(), 1);
+    assert!(p.dirs.load(Ordering::Relaxed) >= 2);
+    assert_eq!(p.found.load(Ordering::Relaxed), 1);
+    assert_eq!(p.lookups_done.load(Ordering::Relaxed), 1);
+    let log = p.take_log().join("\n");
+    assert!(log.contains("▶ Scanning folder ~/Downloads"), "{log}");
+    assert!(log.contains("~/Downloads/sub"), "{log}");
+    assert!(log.contains("Found") && log.contains("big.dmg"), "{log}");
+    assert!(log.contains("git repository"), "{log}");
+    assert!(p.take_log().is_empty(), "log drains");
+}

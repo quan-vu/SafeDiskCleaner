@@ -5,6 +5,15 @@ It finds large, old files, can optionally ask the Claude CLI for a conservative 
 opinion (opt-in, metadata only, never file contents) and lets you move them to the Trash.
 Nothing is ever deleted automatically.
 
+- **Auto scan** on an interval you pick in Settings (5 min to 2 h, default 10 min). Files that
+  haven't changed keep their earlier Claude verdict, so only new or changed files are sent.
+- **Lists**: bookmark files into your own lists ("App Large Files" and "Document Large Files" to
+  start with). Files show a type badge (App, Document, Video…) you can filter by. Entries whose
+  file no longer exists are removed when you open a list.
+- **Daily changes**: one snapshot per day (from the day's last scan) of used/free space per volume,
+  size of each top-level folder under the scan folders, and the large files found. Compare any day
+  with the day before it.
+
 Data lives in `~/Library/Application Support/Safety Disk Cleaner/cleaner.db`
 (the same database the earlier Go version used, so settings carry over).
 
@@ -53,12 +62,14 @@ make test     # cargo test --workspace
 make lint     # clippy, warnings as errors
 make bundle   # dist/Safety Disk Cleaner.app
 make dmg      # + dist/safety-disk-cleaner-<version>-arm64.dmg
-make run      # bundle and open
+make install  # build and install the only copy in /Applications (removes old copies and dist/)
+make run      # install and open
 ```
 
 ## Notes
 
 - Only one instance runs at a time; a second launch shows the running window.
+- The app shows in the Dock and the menu bar; closing the window only hides it.
 - The UI language follows the system's preferred language (Vietnamese or English).
 - Trash uses `NSFileManager.trashItemAtURL`.
 - Ad-hoc signed only; notarization (Developer ID) is not set up yet.

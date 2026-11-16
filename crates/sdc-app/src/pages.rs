@@ -6,11 +6,13 @@ use crate::system;
 use crate::ui::*;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::*;
 use objc2_foundation::*;
+use sdc_core::category::Category;
 use sdc_core::format;
 use sdc_core::model::*;
+use sdc_core::snapshot::{compare, Snapshot};
 use sdc_core::sysstats::ProcIo;
 use std::path::Path;
 
@@ -116,11 +118,12 @@ fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
     toggle.centerYAnchor().constraintEqualToAnchor(&name.centerYAnchor()).setActive(true);
     name.trailingAnchor().constraintLessThanOrEqualToAnchor_constant(&toggle.leadingAnchor(), -6.0).setActive(true);
 
-    let items: [(Page, &str, Retained<NSColor>, String); 4] = [
+    let items: [(Page, &str, Retained<NSColor>, String); 5] = [
         (Page::Overview, "square.grid.2x2.fill", Palette::gray(), tr("Tổng quan", "Overview")),
         (Page::Files, "list.bullet", Palette::green(), tr("Tệp cần xem", "Files to review")),
         (Page::Disk, "waveform.path.ecg", Palette::orange(), tr("Hoạt động đĩa", "Disk activity")),
         (Page::Volumes, "internaldrive.fill", Palette::indigo(), tr("Ổ đĩa", "Volumes")),
+        (Page::Changes, "calendar", Palette::cyan(), tr("Thay đổi theo ngày", "Daily changes")),
     ];
     for (page, sym, color, title) in items {
         add_full(&s, &nav_row(a, page, sym, &color, &title));
@@ -128,6 +131,17 @@ fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
     add_full(&s, &section(mtm, &tr("Dọn dẹp", "Cleanup")));
     add_full(&s, &nav_row(a, Page::Ignored, "eye.slash.fill", &Palette::gray(), &tr("Đã bỏ qua", "Ignored")));
     add_full(&s, &nav_row(a, Page::History, "clock.fill", &Palette::gray(), &tr("Lịch sử", "History")));
+    add_full(&s, &section(mtm, &tr("Danh sách", "Lists")));
+    let lists_box = vstack(mtm, 2.0);
+    add_full(&s, &lists_box);
+    *a.lists_box.borrow_mut() = Some(lists_box);
+    rebuild_sidebar_lists(a);
+    let new_list = link_button(mtm, &tr("Danh sách mới", "New list"), &Palette::blue(), &a.keep_target(|_| later(|a| a.new_list(false))));
+    with_symbol(&new_list, "plus");
+    let nl = hstack(mtm, 0.0);
+    nl.setEdgeInsets(NSEdgeInsets { top: 4.0, left: 10.0, bottom: 0.0, right: 10.0 });
+    add(&nl, &new_list);
+    add_full(&s, &nl);
     add_full(&s, &section(mtm, &tr("Ứng dụng", "App")));
     add_full(&s, &nav_row(a, Page::Settings, "slider.horizontal.3", &Palette::gray(), &tr("Cài đặt", "Settings")));
     let sp = spacer(mtm);
@@ -149,6 +163,22 @@ fn build_sidebar(a: &App) -> Retained<NSVisualEffectView> {
     fx
 }
 
+/// Refill the sidebar's list rows from `a.lists`.
+pub fn rebuild_sidebar_lists(a: &App) {
+    let Some(stack) = a.lists_box.borrow().clone() else { return };
+    a.nav.borrow_mut().retain(|n| !matches!(n.page, Page::List(_)));
+    for v in stack.arrangedSubviews().iter() {
+        stack.removeArrangedSubview(&v);
+        v.removeFromSuperview();
+    }
+    let lists = a.lists.borrow().clone();
+    for l in &lists {
+        let row = nav_row(a, Page::List(l.id), "bookmark.fill", &Palette::orange(), &l.name);
+        add_full(&stack, &row);
+    }
+    a.highlight_nav();
+}
+
 fn section(mtm: MainThreadMarker, title: &str) -> Retained<NSView> {
     let v = NSView::new(mtm);
     v.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -168,6 +198,8 @@ fn nav_row(a: &App, page: Page, sym: &str, color: &NSColor, title: &str) -> Reta
     h.setEdgeInsets(NSEdgeInsets { top: 0.0, left: 10.0, bottom: 0.0, right: 10.0 });
     add(&h, &icon_tile(mtm, sym, color, &NSColor::whiteColor(), 22.0, 11.0));
     let t = label(mtm, title, &font(14.0, W::Regular), &Palette::primary());
+    t.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    t.setContentCompressionResistancePriority_forOrientation(250.0, NSLayoutConstraintOrientation::Horizontal);
     add(&h, &t);
     add(&h, &spacer(mtm));
     let metric_color = Palette::secondary();
@@ -231,7 +263,7 @@ pub fn fill_tray_menu(a: &App, item: &NSStatusItem) {
         a.show_window();
         a.navigate(Page::Files);
     });
-    action(&tr("Quét ngay", "Scan now"), "r", |a| a.start_scan());
+    action(&tr("Quét ngay", "Scan now"), "r", |a| a.scan_now());
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let last = a.settings.borrow().last_scan;
     info(&format!("{} {}", tr("Lần quét:", "Last scan:"), fmt_time(&last)));
@@ -287,8 +319,29 @@ pub fn render(a: &App) {
     show_sidebar(a, !a.sidebar_collapsed.get());
     let body = match a.page.get() {
         Page::Overview => overview_page(a),
-        Page::Files => files_page(a, false),
-        Page::Ignored => files_page(a, true),
+        Page::Files => files_page(a, Mode::Review),
+        Page::Ignored => files_page(a, Mode::Ignored),
+        Page::Changes => changes_page(a),
+        Page::List(id) => {
+            if !a.lists.borrow().iter().any(|l| l.id == id) {
+                a.page.set(Page::Files);
+                a.highlight_nav();
+                files_page(a, Mode::Review)
+            } else {
+                // Prefer the latest scan data for files still in the scan results.
+                let current = a.candidates.borrow();
+                let items = a
+                    .store
+                    .bookmarks(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| current.iter().find(|c| c.id == b.id).cloned().map(|mut c| { c.ignored = false; c }).unwrap_or(b))
+                    .collect();
+                drop(current);
+                *a.list_items.borrow_mut() = items;
+                files_page(a, Mode::List(id))
+            }
+        }
         Page::Disk => disk_page(a),
         Page::Volumes => volumes_page(a),
         Page::History => history_page(a),
@@ -347,11 +400,13 @@ fn scan_button(a: &App) -> Retained<NSView> {
         spin.setControlSize(NSControlSize::Small);
         unsafe { spin.startAnimation(None) };
         add(&h, &spin);
-        let stop = button(mtm, &tr("Dừng", "Stop"), &a.target(|a| a.cancel.store(true, std::sync::atomic::Ordering::Relaxed)));
+        let show = button(mtm, &tr("Xem tiến trình", "Show progress"), &a.target(|_| later(|a| a.open_scan_sheet())));
+        add(&h, &show);
+        let stop = button(mtm, &tr("Dừng", "Stop"), &a.target(|a| a.stop_scan()));
         add(&h, &stop);
         return h.into_view();
     }
-    let b = primary_button(mtm, &tr("Quét ngay", "Scan now"), &a.target(|a| a.start_scan()));
+    let b = primary_button(mtm, &tr("Quét ngay", "Scan now"), &a.target(|_| later(|a| a.scan_now())));
     with_symbol(&b, "arrow.clockwise");
     b.into_view()
 }
@@ -701,18 +756,88 @@ pub fn fill_procs(a: &App, stack: &NSStackView, procs: &[ProcIo]) {
 
 // ================================================================ files
 
-fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Review,
+    Ignored,
+    List(i64),
+}
+
+/// Pop-up of file categories ("All types" first) bound to `a.category_filter`.
+fn category_popup(a: &App) -> Retained<NSView> {
     let mtm = a.mtm;
+    let pop = unsafe {
+        NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(130.0, 26.0)), false)
+    };
+    pop.addItemWithTitle(&ns(&tr("Mọi loại", "All types")));
+    for c in Category::ALL {
+        let (vi, en) = c.names();
+        pop.addItemWithTitle(&ns(&tr(vi, en)));
+    }
+    let current = a.category_filter.get().and_then(|c| Category::ALL.iter().position(|x| *x == c)).map(|i| i + 1).unwrap_or(0);
+    pop.selectItemAtIndex(current as isize);
+    let pop_ref = pop.clone();
+    let t = a.target(move |a| {
+        let i = pop_ref.indexOfSelectedItem();
+        a.category_filter.set(if i <= 0 { None } else { Category::ALL.get(i as usize - 1).copied() });
+        a.request_render();
+    });
+    unsafe {
+        pop.setTarget(Some(&t));
+        pop.setAction(Some(fire_sel()));
+    }
+    pop.into_view()
+}
+
+/// "Add to list" button that pops up the lists plus "New list…".
+fn add_to_list_button(a: &App) -> Retained<NSButton> {
+    let mtm = a.mtm;
+    let b = button(mtm, &tr("Thêm vào danh sách", "Add to list"), &a.target(|_| {}));
+    with_symbol(&b, "bookmark");
+    let b_ref = b.clone();
+    let t = a.target(move |a| {
+        let menu = NSMenu::new(a.mtm);
+        menu.setAutoenablesItems(false);
+        for l in a.lists.borrow().iter() {
+            let id = l.id;
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(a.mtm), &ns(&l.name), Some(fire_sel()), &ns(""))
+            };
+            let tg = a.target(move |_| later(move |a| a.add_selected_to_list(id)));
+            unsafe { item.setTarget(Some(&tg)) };
+            menu.addItem(&item);
+        }
+        if !a.lists.borrow().is_empty() {
+            menu.addItem(&NSMenuItem::separatorItem(a.mtm));
+        }
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(a.mtm), &ns(&tr("Danh sách mới…", "New list…")), Some(fire_sel()), &ns(""))
+        };
+        let tg = a.target(|_| later(|a| a.new_list(true)));
+        unsafe { item.setTarget(Some(&tg)) };
+        menu.addItem(&item);
+        let h = b_ref.bounds().size.height;
+        menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0.0, h + 4.0), Some(&b_ref));
+    });
+    unsafe { b.setTarget(Some(&t)) };
+    b
+}
+
+fn files_page(a: &App, mode: Mode) -> Retained<NSView> {
+    let mtm = a.mtm;
+    let ignored_page = mode == Mode::Ignored;
     let query = a.filter.borrow().to_lowercase();
     let tab = a.tab.get();
-    let mut items: Vec<Candidate> = a
-        .candidates
-        .borrow()
-        .iter()
-        .filter(|c| c.ignored == ignored_page)
+    let category = a.category_filter.get();
+    let source: Vec<Candidate> = match mode {
+        Mode::List(_) => a.list_items.borrow().clone(),
+        _ => a.candidates.borrow().iter().filter(|c| c.ignored == ignored_page).cloned().collect(),
+    };
+    let mut items: Vec<Candidate> = source
+        .into_iter()
         .filter(|c| query.is_empty() || c.path.to_lowercase().contains(&query))
-        .filter(|c| ignored_page || tab == 0 || (tab == 1) == (c.safety == Safety::Safe))
-        .cloned()
+        .filter(|c| mode != Mode::Review || tab == 0 || (tab == 1) == (c.safety == Safety::Safe))
+        .filter(|c| category.is_none_or(|k| Category::of(Path::new(&c.path)) == k))
         .collect();
     if a.sort_small.get() {
         items.sort_by_key(|c| c.size);
@@ -768,8 +893,16 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
         let empty = vstack(mtm, 6.0);
         empty.setEdgeInsets(NSEdgeInsets { top: 40.0, left: 16.0, bottom: 40.0, right: 16.0 });
         empty.setAlignment(NSLayoutAttribute::CenterX);
-        add(&empty, &symbol_view(mtm, if ignored_page { "eye.slash" } else { "checkmark.circle" }, 28.0, &Palette::tertiary()));
-        add(&empty, &label(mtm, &if ignored_page { tr("Không có tệp nào bị bỏ qua.", "No ignored files.") } else { tr("Không có tệp phù hợp.", "No matching files.") }, &font(14.0, W::Regular), &Palette::secondary()));
+        let (sym, text) = match mode {
+            Mode::Ignored => ("eye.slash", tr("Không có tệp nào bị bỏ qua.", "No ignored files.")),
+            Mode::List(_) => (
+                "bookmark",
+                tr("Danh sách trống. Chọn tệp ở \"Tệp cần xem\" rồi bấm \"Thêm vào danh sách\".", "This list is empty. Select files in Files to review and choose Add to list."),
+            ),
+            Mode::Review => ("checkmark.circle", tr("Không có tệp phù hợp.", "No matching files.")),
+        };
+        add(&empty, &symbol_view(mtm, sym, 28.0, &Palette::tertiary()));
+        add(&empty, &label(mtm, &text, &font(14.0, W::Regular), &Palette::secondary()));
         add_full(&list, &empty);
     }
     for item in items.iter().take(1000) {
@@ -793,15 +926,25 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
     add(&bar, &txt);
     add(&bar, &spacer(mtm));
     let reveal = button(mtm, &tr("Mở trong Finder", "Reveal in Finder"), &a.target(|a| a.reveal_selected()));
-    let ignore = if ignored_page {
-        button(mtm, &tr("Đưa lại danh sách", "Restore"), &a.target(|a| a.ignore_selected(false)))
-    } else {
-        button(mtm, &tr("Bỏ qua", "Ignore"), &a.target(|a| a.ignore_selected(true)))
-    };
-    let delete = destructive_button(mtm, &tr("Xoá vĩnh viễn…", "Delete permanently…"), &a.target(|_| later(|a| a.confirm_delete())));
+    let mut buttons = vec![reveal];
+    match mode {
+        Mode::List(_) => {
+            buttons.push(button(mtm, &tr("Bỏ khỏi danh sách", "Remove from list"), &a.target(|a| a.remove_selected_from_list())));
+        }
+        Mode::Ignored => {
+            buttons.push(add_to_list_button(a));
+            buttons.push(button(mtm, &tr("Đưa lại danh sách", "Restore"), &a.target(|a| a.ignore_selected(false))));
+        }
+        Mode::Review => {
+            buttons.push(add_to_list_button(a));
+            buttons.push(button(mtm, &tr("Bỏ qua", "Ignore"), &a.target(|a| a.ignore_selected(true))));
+        }
+    }
+    buttons.push(destructive_button(mtm, &tr("Xoá vĩnh viễn…", "Delete permanently…"), &a.target(|_| later(|a| a.confirm_delete()))));
     let trash = primary_button(mtm, &tr("Chuyển vào Thùng rác", "Move to Trash"), &a.target(|_| later(|a| a.confirm_trash())));
     with_symbol(&trash, "trash");
-    for b in [&reveal, &ignore, &delete, &trash] {
+    buttons.push(trash);
+    for b in &buttons {
         add(&bar, b);
     }
     bar_box.addSubview(&bar);
@@ -814,15 +957,15 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
         let mut refs = a.refs.borrow_mut();
         refs.rows = rows;
         refs.sel_label = Some(sel_label);
-        refs.sel_buttons = vec![reveal, ignore, delete, trash];
+        refs.sel_buttons = buttons;
     }
 
-    // Header accessories: search + filter
+    // Header accessories: search + filters
     let search = NSSearchField::new(mtm);
     search.setPlaceholderString(Some(&ns(&tr("Lọc theo đường dẫn", "Filter by path"))));
     search.setStringValue(&ns(&a.filter.borrow()));
     search.setTranslatesAutoresizingMaskIntoConstraints(false);
-    search.widthAnchor().constraintEqualToConstant(220.0).setActive(true);
+    search.widthAnchor().constraintEqualToConstant(200.0).setActive(true);
     let search_ref = search.clone();
     let st = a.target(move |a| {
         *a.filter.borrow_mut() = search_ref.stringValue().to_string();
@@ -833,7 +976,7 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
         search.setAction(Some(fire_sel()));
     }
     search.setSendsWholeSearchString(true);
-    let mut acc: Vec<Retained<NSView>> = vec![search.into_view()];
+    let mut acc: Vec<Retained<NSView>> = vec![search.into_view(), category_popup(a)];
     let (safe_n, review_n) = {
         let c = a.candidates.borrow();
         (
@@ -841,7 +984,7 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
             c.iter().filter(|c| !c.ignored && c.safety != Safety::Safe).count(),
         )
     };
-    if !ignored_page {
+    if mode == Mode::Review {
         let labels = [
             tr(&format!("Tất cả {}", safe_n + review_n), &format!("All {}", safe_n + review_n)),
             tr(&format!("An toàn {safe_n}"), &format!("Safe {safe_n}")),
@@ -857,13 +1000,22 @@ fn files_page(a: &App, ignored_page: bool) -> Retained<NSView> {
         acc.push(seg.into_view());
     }
     let total: i64 = items.iter().map(|c| c.size).sum();
-    let (title, subtitle) = if ignored_page {
-        (tr("Đã bỏ qua", "Ignored"), tr(&format!("{} tệp không còn được gợi ý", items.len()), &format!("{} files no longer suggested", items.len())))
-    } else {
-        (
+    let (title, subtitle) = match mode {
+        Mode::Ignored => (tr("Đã bỏ qua", "Ignored"), tr(&format!("{} tệp không còn được gợi ý", items.len()), &format!("{} files no longer suggested", items.len()))),
+        Mode::Review => (
             tr("Tệp cần xem", "Files to review"),
             tr(&format!("{} tệp · tối đa {}", items.len(), format::bytes(total)), &format!("{} files · up to {}", items.len(), format::bytes(total))),
-        )
+        ),
+        Mode::List(id) => {
+            let rename = button(mtm, &tr("Đổi tên", "Rename"), &a.target(move |_| later(move |a| a.rename_list(id))));
+            with_symbol(&rename, "pencil");
+            acc.push(rename.into_view());
+            let del = button(mtm, &tr("Xoá danh sách", "Delete list"), &a.target(move |_| later(move |a| a.delete_list(id))));
+            with_symbol(&del, "trash");
+            acc.push(del.into_view());
+            let name = a.lists.borrow().iter().find(|l| l.id == id).map(|l| l.name.clone()).unwrap_or_default();
+            (name, tr(&format!("{} tệp · {}", items.len(), format::bytes(total)), &format!("{} files · {}", items.len(), format::bytes(total))))
+        }
     };
     frame(a, &title, &subtitle, acc, &body)
 }
@@ -916,11 +1068,28 @@ fn file_row(a: &App, c: &Candidate) -> (Retained<ClickView>, Retained<NSButton>)
     let h = table_row_layout(mtm);
     let p = Path::new(&c.path);
     let name_col = vstack(mtm, 2.0);
-    add(&name_col, &label(mtm, &p.file_name().unwrap_or_default().to_string_lossy(), &font(14.0, W::Semibold), &Palette::primary()));
+    let name_line = hstack(mtm, 5.0);
+    let nl = label(mtm, &p.file_name().unwrap_or_default().to_string_lossy(), &font(14.0, W::Semibold), &Palette::primary());
+    nl.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    nl.setContentCompressionResistancePriority_forOrientation(100.0, NSLayoutConstraintOrientation::Horizontal);
+    add(&name_line, &nl);
+    if let Some(lists) = a.bookmark_index.borrow().get(&c.id) {
+        let mark = symbol_view(mtm, "bookmark.fill", 11.0, &Palette::orange());
+        mark.setToolTip(Some(&ns(&lists.join(", "))));
+        add(&name_line, &mark);
+    }
+    add(&name_col, &name_line);
+    let dir_line = hstack(mtm, 4.0);
+    let cat = Category::of(p);
+    let (vi, en) = cat.names();
+    add(&dir_line, &symbol_view(mtm, cat.symbol(), 10.0, &Palette::secondary()));
+    add(&dir_line, &label(mtm, &format!("{} ·", tr(vi, en)), &font(12.0, W::Medium), &Palette::secondary()));
     let dir = p.parent().map(|d| d.to_string_lossy().replace(&*a.home.to_string_lossy(), "~")).unwrap_or_default();
     let dl = label(mtm, &dir, &font(12.0, W::Regular), &Palette::tertiary());
     dl.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
-    add(&name_col, &dl);
+    dl.setContentCompressionResistancePriority_forOrientation(100.0, NSLayoutConstraintOrientation::Horizontal);
+    add(&dir_line, &dl);
+    add(&name_col, &dir_line);
     let reason = hstack(mtm, 6.0);
     add(&reason, &symbol_view(mtm, "sparkles", 11.0, &Palette::purple()));
     let rl = label(mtm, &c.reason, &font(12.0, W::Regular), &Palette::secondary());
@@ -1029,6 +1198,174 @@ fn history_page(a: &App) -> Retained<NSView> {
     frame(a, &tr("Lịch sử", "History"), &tr(&format!("{} thao tác gần nhất", records.len()), &format!("{} recent actions", records.len())), vec![], &sc)
 }
 
+// ================================================================ daily changes
+
+/// "+1.2 GB" / "−300 MB" / "0 B".
+fn signed_bytes(d: i64) -> String {
+    match d.signum() {
+        1 => format!("+{}", format::bytes(d)),
+        -1 => format!("−{}", format::bytes(-d)),
+        _ => "0 B".into(),
+    }
+}
+
+fn delta_color(d: i64) -> Retained<NSColor> {
+    match d.signum() {
+        1 => Palette::red(),
+        -1 => Palette::green(),
+        _ => Palette::secondary(),
+    }
+}
+
+fn day_text(day: &str) -> String {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map(|d| {
+            let wd = d.format("%a").to_string();
+            format!("{} · {}", d.format("%d/%m/%Y"), wd)
+        })
+        .unwrap_or_else(|_| day.to_string())
+}
+
+fn fixed(v: &NSView, w: f64) -> Retained<NSView> {
+    size(v, w, 0.0);
+    v.retain()
+}
+
+fn changes_page(a: &App) -> Retained<NSView> {
+    let mtm = a.mtm;
+    let snaps: Vec<Snapshot> = a.store.snapshots(31).unwrap_or_default();
+    let s = page_stack(mtm);
+    let subtitle = tr(
+        "Mỗi ngày lưu một bản ghi sau lần quét cuối · dung lượng đã dùng tính cho cả ổ, chi tiết thư mục chỉ trong thư mục quét",
+        "One snapshot per day from the last scan · used space covers the whole volume, folder details cover scan folders only",
+    );
+    if snaps.is_empty() {
+        let (c, inner) = card(mtm, 18.0, 6.0);
+        add(&inner, &label(mtm, &tr("Chưa có bản ghi nào.", "No snapshots yet."), &font(14.0, W::Semibold), &Palette::primary()));
+        add(&inner, &wrapping(mtm, &tr("Bản ghi đầu tiên được lưu sau lần quét tới. Thay đổi hiện ra từ ngày thứ hai.", "The first snapshot is saved after the next scan. Changes appear from the second day."), &font(13.0, W::Regular), &Palette::secondary()));
+        add_full(&s, &c);
+        let sc = scroller(mtm, &s);
+        return frame(a, &tr("Thay đổi theo ngày", "Daily changes"), &subtitle, vec![scan_button(a)], &sc);
+    }
+    let pick = a.changes_day.get().min(snaps.len() - 1);
+
+    // Day by day
+    let (c1, inner) = card(mtm, 18.0, 0.0);
+    add_full(&inner, &card_header(mtm, "calendar", &Palette::cyan(), &tr("Từng ngày", "Day by day"), None));
+    inner.setCustomSpacing_afterView(10.0, &inner.arrangedSubviews().lastObject().unwrap());
+    let head = hstack(mtm, 12.0);
+    head.setEdgeInsets(NSEdgeInsets { top: 0.0, left: 10.0, bottom: 0.0, right: 10.0 });
+    head.heightAnchor().constraintEqualToConstant(28.0).setActive(true);
+    let hdr = |t: &str| label(mtm, t, &font(12.0, W::Semibold), &Palette::secondary());
+    add(&head, &fixed(&hdr(&tr("Ngày", "Day")), 170.0));
+    add(&head, &fixed(&hdr(&tr("Đã dùng", "Used")), 110.0));
+    add(&head, &fixed(&hdr(&tr("Thay đổi", "Change")), 110.0));
+    add(&head, &fixed(&hdr(&tr("Còn trống", "Free")), 110.0));
+    add(&head, &hdr(&tr("Tệp lớn", "Large files")));
+    add(&head, &spacer(mtm));
+    add_full(&inner, &head);
+    add_full(&inner, &separator(mtm));
+    for (i, snap) in snaps.iter().enumerate() {
+        let row = ClickView::new(mtm, &Palette::tint(&NSColor::controlAccentColor(), 0.14), 6.0);
+        row.heightAnchor().constraintEqualToConstant(36.0).setActive(true);
+        row.on_click(move || {
+            let a = app();
+            a.changes_day.set(i);
+            a.request_render();
+        });
+        row.set_selected(i == pick);
+        let h = hstack(mtm, 12.0);
+        h.setEdgeInsets(NSEdgeInsets { top: 0.0, left: 10.0, bottom: 0.0, right: 10.0 });
+        add(&h, &fixed(&label(mtm, &day_text(&snap.day), &digits(13.0, W::Regular), &Palette::primary()), 170.0));
+        add(&h, &fixed(&label(mtm, &format::bytes(snap.used()), &digits(13.0, W::Semibold), &Palette::primary()), 110.0));
+        let (dt, dc) = match snaps.get(i + 1) {
+            Some(prev) => {
+                let d = snap.used() - prev.used();
+                (signed_bytes(d), delta_color(d))
+            }
+            None => ("—".to_string(), Palette::tertiary()),
+        };
+        add(&h, &fixed(&label(mtm, &dt, &digits(13.0, W::Semibold), &dc), 110.0));
+        let free: i64 = snap.volumes.iter().map(|v| v.free_bytes).sum();
+        add(&h, &fixed(&label(mtm, &format::bytes(free), &digits(13.0, W::Regular), &Palette::secondary()), 110.0));
+        let total: i64 = snap.files.iter().map(|f| f.size).sum();
+        add(&h, &label(mtm, &format!("{} · {}", snap.files.len(), format::bytes(total)), &digits(13.0, W::Regular), &Palette::secondary()));
+        add(&h, &spacer(mtm));
+        row.addSubview(&h);
+        pin(&h, &row, 0.0);
+        add_full(&inner, &row);
+    }
+    add_full(&s, &c1);
+
+    // Details for the picked day
+    let snap = &snaps[pick];
+    let (c2, inner) = card(mtm, 18.0, 4.0);
+    let home = a.home.to_string_lossy().to_string();
+    let short = |p: &str| p.replace(&home, "~");
+    let line = |left: &str, mid: String, right: String, color: Retained<NSColor>| {
+        let h = hstack(mtm, 12.0);
+        h.heightAnchor().constraintEqualToConstant(30.0).setActive(true);
+        let l = label(mtm, left, &font(13.0, W::Regular), &Palette::primary());
+        l.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        l.setToolTip(Some(&ns(left)));
+        l.setContentCompressionResistancePriority_forOrientation(100.0, NSLayoutConstraintOrientation::Horizontal);
+        add(&h, &l);
+        add(&h, &spacer(mtm));
+        add(&h, &label(mtm, &mid, &digits(12.0, W::Regular), &Palette::secondary()));
+        let r = label(mtm, &right, &digits(13.0, W::Semibold), &color);
+        r.setAlignment(NSTextAlignment::Right);
+        add(&h, &fixed(&r, 96.0));
+        h
+    };
+    let sub = |t: &str| label(mtm, t, &font(13.0, W::Semibold), &Palette::secondary());
+    match snaps.get(pick + 1) {
+        None => {
+            add_full(&inner, &card_header(mtm, "folder.fill", &Palette::blue(), &tr(&format!("Kích thước thư mục · {}", day_text(&snap.day)), &format!("Folder sizes · {}", day_text(&snap.day))), None));
+            add(&inner, &label(mtm, &tr("Chưa có ngày trước để so sánh; đây là kích thước hiện tại.", "No earlier day to compare yet; these are the current sizes."), &font(12.0, W::Regular), &Palette::tertiary()));
+            for (p, size) in snap.folders.iter().take(15) {
+                add_full(&inner, &line(&short(p), String::new(), format::bytes(*size), Palette::primary()));
+            }
+        }
+        Some(prev) => {
+            let ch = compare(prev, snap);
+            add_full(&inner, &card_header(
+                mtm,
+                "arrow.left.arrow.right",
+                &Palette::blue(),
+                &tr(&format!("{} so với {}", day_text(&snap.day), day_text(&prev.day)), &format!("{} vs {}", day_text(&snap.day), day_text(&prev.day))),
+                Some(label(mtm, &signed_bytes(ch.used_delta), &digits(17.0, W::Semibold), &delta_color(ch.used_delta)).into_view()),
+            ));
+            for (v, pv) in snap.volumes.iter().map(|v| (v, prev.volumes.iter().find(|p| p.path == v.path))) {
+                if let Some(pv) = pv {
+                    let d = v.used() - pv.used();
+                    add_full(&inner, &line(&v.name, format!("{} → {}", format::bytes(pv.used()), format::bytes(v.used())), signed_bytes(d), delta_color(d)));
+                }
+            }
+            add_full(&inner, &separator(mtm));
+            add(&inner, &sub(&tr("Thư mục thay đổi nhiều nhất", "Folders that changed most")));
+            if ch.folders.is_empty() {
+                add(&inner, &label(mtm, &tr("Không có thay đổi trong thư mục quét.", "No changes in scan folders."), &font(12.0, W::Regular), &Palette::tertiary()));
+            }
+            for (p, before, after) in ch.folders.iter().take(12) {
+                let d = after - before;
+                add_full(&inner, &line(&short(p), format!("{} → {}", format::bytes(*before), format::bytes(*after)), signed_bytes(d), delta_color(d)));
+            }
+            add_full(&inner, &separator(mtm));
+            add(&inner, &sub(&tr(&format!("Tệp lớn mới ({})", ch.new_files.len()), &format!("New large files ({})", ch.new_files.len()))));
+            for f in ch.new_files.iter().take(10) {
+                add_full(&inner, &line(&short(&f.path), String::new(), format!("+{}", format::bytes(f.size)), Palette::red()));
+            }
+            add(&inner, &sub(&tr(&format!("Tệp lớn đã mất ({})", ch.gone_files.len()), &format!("Large files gone ({})", ch.gone_files.len()))));
+            for f in ch.gone_files.iter().take(10) {
+                add_full(&inner, &line(&short(&f.path), String::new(), format!("−{}", format::bytes(f.size)), Palette::green()));
+            }
+        }
+    }
+    add_full(&s, &c2);
+    let sc = scroller(mtm, &s);
+    frame(a, &tr("Thay đổi theo ngày", "Daily changes"), &subtitle, vec![scan_button(a)], &sc)
+}
+
 // ================================================================ settings
 
 fn settings_page(a: &App) -> Retained<NSView> {
@@ -1052,7 +1389,7 @@ fn settings_page(a: &App) -> Retained<NSView> {
     inner.setCustomSpacing_afterView(6.0, &inner.arrangedSubviews().lastObject().unwrap());
     type Toggle = (String, Option<String>, bool, fn(&mut Settings, bool));
     let toggles: [Toggle; 4] = [
-        (tr("Tự quét mỗi 2 giờ", "Scan every 2 hours"), Some(tr("Chỉ quét và thông báo, không tự xoá", "Scans and notifies only, never deletes")), d.auto_scan, |s, v| s.auto_scan = v),
+        (tr("Tự động quét", "Auto scan"), Some(tr("Chỉ quét và thông báo, không tự xoá", "Scans and notifies only, never deletes")), d.auto_scan, |s, v| s.auto_scan = v),
         (tr("Mở khi đăng nhập", "Open at login"), None, d.open_at_login, |s, v| s.open_at_login = v),
         (tr("Đánh giá bằng Claude CLI", "Review with Claude CLI"), Some(tr("Chỉ gửi đường dẫn, kích thước, ngày", "Sends only paths, sizes and dates")), d.ai_review, |s, v| s.ai_review = v),
         (tr("Quét toàn bộ Home", "Scan all of Home"), Some(tr("Trừ các vùng được bảo vệ", "Except protected areas")), d.scan_home, |s, v| s.scan_home = v),
@@ -1079,6 +1416,29 @@ fn settings_page(a: &App) -> Retained<NSView> {
         unsafe { sw.setTarget(Some(&tgt)) };
         add(&h, &sw);
         add_full(&inner, &h);
+        if i == 0 {
+            // Interval right under the auto-scan toggle.
+            add_full(&inner, &separator(mtm));
+            let h = hstack(mtm, 8.0);
+            h.heightAnchor().constraintEqualToConstant(50.0).setActive(true);
+            add(&h, &label(mtm, &tr("Quét mỗi", "Scan every"), &font(14.0, W::Regular), &Palette::primary()));
+            add(&h, &spacer(mtm));
+            const CHOICES: [i64; 5] = [5, 10, 30, 60, 120];
+            let labels: Vec<String> = CHOICES.iter().map(|m| interval_text(*m)).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let sel = CHOICES.iter().position(|m| *m == d.scan_interval_minutes).map(|i| i as isize).unwrap_or(-1);
+            let seg = segmented(mtm, &refs, sel, &a.target(|_| {}));
+            let seg_ref = seg.clone();
+            let t = a.target(move |a| {
+                let i = seg_ref.selectedSegment();
+                if let Some(m) = usize::try_from(i).ok().and_then(|i| CHOICES.get(i)) {
+                    a.edit_draft(|s| s.scan_interval_minutes = *m);
+                }
+            });
+            unsafe { seg.setTarget(Some(&t)) };
+            add(&h, &seg);
+            add_full(&inner, &h);
+        }
     }
     add(&row1, &c1);
 
@@ -1265,7 +1625,7 @@ fn setup_page(a: &App) -> Retained<NSView> {
     go.setKeyEquivalent(&ns("\r"));
     add_full(&s, &go);
     let status = a.status.borrow().clone();
-    add(&s, &label(mtm, &if status.is_empty() { tr("Bật tự quét mỗi 2 giờ và mở khi đăng nhập · đổi được trong Cài đặt", "Auto-scan every 2 hours and open at login · change in Settings") } else { status }, &font(12.0, W::Regular), &Palette::tertiary()));
+    add(&s, &label(mtm, &if status.is_empty() { tr("Bật tự quét mỗi 10 phút và mở khi đăng nhập · đổi được trong Cài đặt", "Auto-scan every 10 minutes and open at login · change in Settings") } else { status }, &font(12.0, W::Regular), &Palette::tertiary()));
     let _ = ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*outer);
     outer
 }

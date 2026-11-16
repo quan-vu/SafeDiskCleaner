@@ -1,4 +1,4 @@
-.PHONY: test lint build bundle dmg run
+.PHONY: test lint build bundle dmg install run
 
 test:
 	cargo test --workspace
@@ -15,5 +15,9 @@ bundle:
 dmg:
 	./scripts/bundle.sh --dmg
 
-run: bundle
-	open "dist/Safety Disk Cleaner.app"
+# Build and install the single latest copy in /Applications.
+install:
+	./scripts/install.sh
+
+run:
+	./scripts/install.sh --open

@@ -13,11 +13,13 @@ use sdc_core::action::{delete_permanently, validate_for_action};
 use sdc_core::format;
 use sdc_core::model::*;
 use sdc_core::review;
-use sdc_core::scan::{scan, volume_stats};
-use sdc_core::store::Store;
+use sdc_core::scan::{scan_with_progress, volume_stats, Progress};
+use sdc_core::category::Category;
+use sdc_core::snapshot::Snapshot;
+use sdc_core::store::{ListInfo, Store};
 use sdc_core::sysstats::{self, DiskImage, Mount, ProcIo, ProcSampler, RateHistory};
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +55,14 @@ pub enum Page {
     Ignored,
     History,
     Settings,
+    /// Day-by-day disk usage changes.
+    Changes,
+    /// A user bookmark list.
+    List(i64),
 }
+
+/// Days of snapshots kept in the database.
+const SNAPSHOT_DAYS: usize = 90;
 
 #[derive(Default)]
 pub struct Live {
@@ -101,7 +110,13 @@ pub struct App {
     pub filter: RefCell<String>,
     pub sort_small: Cell<bool>,
     pub scanning: Cell<bool>,
-    pub cancel: Arc<AtomicBool>,
+    /// Cancel flag of the running scan (a fresh one per scan).
+    pub cancel: RefCell<Arc<AtomicBool>>,
+    /// Bumped per scan; results of an abandoned scan are ignored.
+    pub scan_gen: Cell<u64>,
+    pub progress: RefCell<Option<Arc<Progress>>>,
+    pub scan_started: Cell<Option<Instant>>,
+    pub sheet: RefCell<Option<crate::scan_sheet::ScanSheet>>,
     pub status: RefCell<String>,
     pub range: Cell<isize>,
     pub paused: Cell<bool>,
@@ -124,6 +139,18 @@ pub struct App {
     pub sidebar_collapsed: Cell<bool>,
     /// (main after sidebar, main at window edge) leading constraints.
     pub main_leading: RefCell<Option<(Retained<NSLayoutConstraint>, Retained<NSLayoutConstraint>)>>,
+    /// Bookmark lists with counts, in sidebar order.
+    pub lists: RefCell<Vec<ListInfo>>,
+    /// Files of the list page being shown.
+    pub list_items: RefCell<Vec<Candidate>>,
+    /// file id -> names of lists holding it.
+    pub bookmark_index: RefCell<HashMap<String, Vec<String>>>,
+    pub category_filter: Cell<Option<Category>>,
+    /// Sidebar container refilled with one row per list.
+    pub lists_box: RefCell<Option<Retained<NSStackView>>>,
+    pruning: Cell<bool>,
+    /// Snapshot index (newest = 0) whose changes the Daily changes page details.
+    pub changes_day: Cell<usize>,
 }
 
 pub struct ScanOutcome {
@@ -141,6 +168,8 @@ impl App {
         let store = Store::open(&dir)?;
         let settings = store.load_settings(&home)?;
         let candidates = store.load_candidates()?;
+        let lists = store.lists()?;
+        let bookmark_index = store.bookmark_index()?;
         let a = Rc::new(App {
             mtm,
             home,
@@ -154,7 +183,11 @@ impl App {
             filter: RefCell::new(String::new()),
             sort_small: Cell::new(false),
             scanning: Cell::new(false),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: RefCell::new(Arc::new(AtomicBool::new(false))),
+            scan_gen: Cell::new(0),
+            progress: RefCell::new(None),
+            scan_started: Cell::new(None),
+            sheet: RefCell::new(None),
             status: RefCell::new(String::new()),
             range: Cell::new(0),
             paused: Cell::new(false),
@@ -175,6 +208,13 @@ impl App {
             render_pending: Cell::new(false),
             sidebar_collapsed: Cell::new(false),
             main_leading: RefCell::new(None),
+            lists: RefCell::new(lists),
+            list_items: RefCell::new(vec![]),
+            bookmark_index: RefCell::new(bookmark_index),
+            category_filter: Cell::new(None),
+            lists_box: RefCell::new(None),
+            pruning: Cell::new(false),
+            changes_day: Cell::new(0),
         });
         APP.with(|cell| {
             let _ = cell.set(a.clone());
@@ -222,13 +262,25 @@ impl App {
         }
         self.page.set(page);
         self.status.borrow_mut().clear();
+        if page == Page::Changes {
+            self.changes_day.set(0);
+        }
+        self.highlight_nav();
+        if matches!(page, Page::Files | Page::Ignored | Page::List(_)) {
+            self.prune_missing();
+        }
+        self.request_render();
+    }
+
+    /// Paint the sidebar row of the current page as selected.
+    pub fn highlight_nav(&self) {
+        let page = self.page.get();
         for item in self.nav.borrow().iter() {
             let on = item.page == page;
             item.row.set_selected(on);
             item.title.setTextColor(Some(&*if on { NSColor::whiteColor() } else { Palette::primary() }));
             item.metric.setTextColor(Some(&*if on { NSColor::whiteColor() } else { item.metric_color.clone() }));
         }
-        self.request_render();
     }
 
     pub fn toggle_sidebar(&self) {
@@ -270,9 +322,17 @@ impl App {
         (safe, ns, review, nr)
     }
 
+    /// Files the current page lists: a bookmark list or the scan results.
+    pub fn page_items(&self) -> Vec<Candidate> {
+        match self.page.get() {
+            Page::List(_) => self.list_items.borrow().clone(),
+            _ => self.candidates.borrow().clone(),
+        }
+    }
+
     pub fn selected_items(&self) -> Vec<Candidate> {
         let sel = self.selected.borrow();
-        self.candidates.borrow().iter().filter(|c| sel.contains(&c.id)).cloned().collect()
+        self.page_items().into_iter().filter(|c| sel.contains(&c.id)).collect()
     }
 
     pub fn worst(&self) -> Level {
@@ -308,7 +368,7 @@ impl App {
 
     pub fn maybe_scan(&self) {
         let s = self.settings.borrow().clone();
-        let due = is_zero_time(&s.last_scan) || chrono::Utc::now() - s.last_scan >= chrono::Duration::hours(2);
+        let due = is_zero_time(&s.last_scan) || chrono::Utc::now() - s.last_scan >= chrono::Duration::minutes(s.scan_interval_minutes);
         if s.setup_done && s.auto_scan && !self.scanning.get() && due {
             self.start_scan();
         }
@@ -319,31 +379,58 @@ impl App {
             return;
         }
         self.scanning.set(true);
-        self.cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.cancel.borrow_mut() = cancel.clone();
+        let gen = self.scan_gen.get() + 1;
+        self.scan_gen.set(gen);
+        let progress = Arc::new(Progress::default());
+        *self.progress.borrow_mut() = Some(progress.clone());
+        self.scan_started.set(Some(Instant::now()));
+        progress.log(format!("Scan started {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
         self.set_status(tr("Đang quét…", "Scanning…"));
         let settings = self.settings.borrow().clone();
         let before = self.candidates.borrow().clone();
+        let before_for_review = before.clone();
         let before_level = Level::parse(&settings.last_alert_level);
         let home = self.home.clone();
         let store = self.store.clone();
-        let cancel = self.cancel.clone();
         std::thread::spawn(move || {
             let mut ai_error = None;
             let result = (|| {
-                let r = scan(&home, &settings, None, &cancel).map_err(|e| e.to_string())?;
+                let r = scan_with_progress(&home, &settings, None, &cancel, &progress).map_err(|e| e.to_string())?;
                 let mut cands = r.candidates;
                 if settings.ai_review {
-                    match review::find_claude() {
-                        Some(bin) => {
-                            let (reviewed, err) = review::review(&cands, &home, &settings, Some(&bin), None);
-                            cands = reviewed;
-                            ai_error = err;
+                    // Unchanged files keep their verdict; only new or changed ones go to Claude.
+                    let todo = carry_over(&before_for_review, &mut cands);
+                    if !todo.is_empty() {
+                        match review::find_claude() {
+                            Some(bin) => {
+                                progress.set_phase(tr("Đang nhờ Claude đánh giá…", "Asking Claude to review…"));
+                                progress.log(format!("▶ Asking Claude to review {} files", todo.len()));
+                                let subset: Vec<Candidate> = todo.iter().map(|&i| cands[i].clone()).collect();
+                                let (reviewed, err) = review::review(&subset, &home, &settings, Some(&bin), None);
+                                for (&i, c) in todo.iter().zip(reviewed) {
+                                    cands[i] = c;
+                                }
+                                ai_error = err;
+                            }
+                            None => ai_error = Some("claude CLI not found".into()),
                         }
-                        None => ai_error = Some("claude CLI not found".into()),
                     }
                 }
+                progress.set_phase(tr("Đang lưu kết quả…", "Saving results…"));
                 store.replace_candidates(&cands)?;
                 let saved = store.load_candidates()?;
+                let now = chrono::Local::now();
+                let active: Vec<Candidate> = saved.iter().filter(|c| !c.ignored).cloned().collect();
+                let snap = Snapshot::new(
+                    &now.format("%Y-%m-%d").to_string(),
+                    &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    &r.volumes,
+                    &r.folder_sizes,
+                    &active,
+                );
+                store.save_snapshot(&snap, SNAPSHOT_DAYS)?;
                 let mut s = settings.clone();
                 s.last_scan = chrono::Utc::now();
                 s.last_alert_ids = candidate_ids(&saved);
@@ -352,13 +439,62 @@ impl App {
                 Ok((saved, r.volumes, r.skipped, s))
             })();
             let outcome = ScanOutcome { result, ai_error, before, before_level };
-            later(move |a| a.finish_scan(outcome));
+            later(move |a| a.finish_scan(gen, outcome));
         });
     }
 
-    fn finish_scan(&self, o: ScanOutcome) {
+    /// Stop the running scan. A scan stuck inside a folder read (for example
+    /// behind a macOS permission prompt) cannot notice the cancel flag, so it
+    /// is abandoned: its result will be ignored when it eventually returns.
+    pub fn stop_scan(&self) {
+        if !self.scanning.get() {
+            return;
+        }
+        self.cancel.borrow().store(true, Ordering::Relaxed);
+        let progress = self.progress.borrow().clone();
+        if let Some(p) = &progress {
+            p.log("■ Stopping…");
+        }
+        if progress.is_some_and(|p| p.stalled_for() >= Duration::from_secs(2)) {
+            self.scan_gen.set(self.scan_gen.get() + 1);
+            self.scanning.set(false);
+            if let Some(p) = self.progress.borrow().as_ref() {
+                p.log("■ Scan stopped. The blocked folder read will finish in the background; its result is discarded.");
+            }
+            // Keep showing the stopped scan's log under the new generation.
+            if let Some(s) = self.sheet.borrow_mut().as_mut() {
+                s.keep_log_for(self.scan_gen.get());
+            }
+            self.set_status(tr("Đã dừng quét.", "Scan stopped."));
+        }
+    }
+
+    fn finish_scan(&self, gen: u64, o: ScanOutcome) {
+        if gen != self.scan_gen.get() {
+            debug("ignoring result of an abandoned scan");
+            return;
+        }
         self.scanning.set(false);
+        let progress = self.progress.borrow().clone();
+        let log = |line: String| {
+            if let Some(p) = &progress {
+                p.log(line);
+            }
+        };
+        match &o.result {
+            Err(e) if e == "scan cancelled" => log("■ Scan stopped.".into()),
+            Err(e) => log(format!("✗ Scan failed: {e}")),
+            Ok((saved, _, skipped, _)) => log(format!(
+                "✓ Scan complete in {}s: {} suggestions, {skipped} skipped.",
+                self.scan_started.get().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                saved.iter().filter(|c| !c.ignored).count()
+            )),
+        }
+        if let Some(e) = &o.ai_error {
+            log(format!("⚠ Claude: {e}"));
+        }
         match o.result {
+            Err(e) if e == "scan cancelled" => self.set_status(tr("Đã dừng quét.", "Scan stopped.")),
             Err(e) => self.set_status(e),
             Ok((saved, volumes, skipped, s)) => {
                 let after_level = worst_level(&volumes);
@@ -426,7 +562,7 @@ impl App {
             row.set_selected(on);
             check.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
         }
-        let items: Vec<Candidate> = self.candidates.borrow().iter().filter(|c| sel.contains(&c.id)).cloned().collect();
+        let items: Vec<Candidate> = self.page_items().into_iter().filter(|c| sel.contains(&c.id)).collect();
         let total: i64 = items.iter().map(|c| c.size).sum();
         if let Some(l) = refs.sel_label.as_ref() {
             l.setStringValue(&ns(&if items.is_empty() {
@@ -575,10 +711,12 @@ impl App {
                 Err(e) => failed.push(format!("{}: {e}", Path::new(&c.path).file_name().unwrap_or_default().to_string_lossy())),
             }
         }
-        if let Err(e) = self.store.remove_candidates(&done) {
+        if let Err(e) = self.store.remove_candidates(&done).and_then(|_| self.store.remove_bookmarks_for_files(&done)) {
             failed.push(e);
         }
         self.candidates.borrow_mut().retain(|c| !done.contains(&c.id));
+        self.list_items.borrow_mut().retain(|c| !done.contains(&c.id));
+        self.reload_lists();
         self.selected.borrow_mut().clear();
         self.refresh_volumes();
         self.update_sidebar_counts();
@@ -591,6 +729,151 @@ impl App {
             msg.push_str(&format!(" {} {}", tr("Lỗi:", "Failed:"), failed.join("; ")));
         }
         self.set_status(msg);
+    }
+
+    // ------------------------------------------------------------ bookmark lists
+
+    /// Reload lists and the bookmark index from the store and refresh the sidebar.
+    pub fn reload_lists(&self) {
+        if let Ok(l) = self.store.lists() {
+            *self.lists.borrow_mut() = l;
+        }
+        if let Ok(i) = self.store.bookmark_index() {
+            *self.bookmark_index.borrow_mut() = i;
+        }
+        crate::pages::rebuild_sidebar_lists(self);
+        self.update_sidebar_counts();
+    }
+
+    fn list_name(&self, id: i64) -> String {
+        self.lists.borrow().iter().find(|l| l.id == id).map(|l| l.name.clone()).unwrap_or_default()
+    }
+
+    /// Modal prompt for a list name.
+    fn ask_name(&self, title: &str, initial: &str, ok: &str) -> Option<String> {
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&ns(title));
+        alert.addButtonWithTitle(&ns(ok));
+        alert.addButtonWithTitle(&ns(&tr("Huỷ", "Cancel")));
+        let field = NSTextField::textFieldWithString(&ns(initial), self.mtm);
+        field.setPlaceholderString(Some(&ns(&tr("Tên danh sách", "List name"))));
+        field.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(260.0, 24.0)));
+        alert.setAccessoryView(Some(&field));
+        alert.window().setInitialFirstResponder(Some(&field));
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return None;
+        }
+        let name = field.stringValue().to_string().trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Ask for a name, create the list, and optionally put the selection in it.
+    pub fn new_list(&self, add_selection: bool) {
+        let Some(name) = self.ask_name(&tr("Danh sách mới", "New list"), "", &tr("Tạo", "Create")) else { return };
+        match self.store.create_list(&name) {
+            Err(e) => self.set_status(e),
+            Ok(id) => {
+                self.reload_lists();
+                if add_selection {
+                    self.add_selected_to_list(id);
+                } else {
+                    self.navigate(Page::List(id));
+                }
+            }
+        }
+    }
+
+    pub fn add_selected_to_list(&self, id: i64) {
+        let items = self.selected_items();
+        if items.is_empty() {
+            return;
+        }
+        let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        if let Err(e) = self.store.add_bookmarks(id, &items, &now) {
+            return self.set_status(e);
+        }
+        self.reload_lists();
+        let name = self.list_name(id);
+        self.set_status(tr(
+            &format!("Đã thêm {} tệp vào \"{name}\".", items.len()),
+            &format!("Added {} files to \"{name}\".", items.len()),
+        ));
+    }
+
+    pub fn remove_selected_from_list(&self) {
+        let Page::List(id) = self.page.get() else { return };
+        let ids: Vec<String> = self.selected_items().into_iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.store.remove_bookmarks(id, &ids) {
+            return self.set_status(e);
+        }
+        self.selected.borrow_mut().clear();
+        self.reload_lists();
+        self.set_status(tr(&format!("Đã bỏ {} tệp khỏi danh sách.", ids.len()), &format!("Removed {} files from the list.", ids.len())));
+    }
+
+    pub fn rename_list(&self, id: i64) {
+        let old = self.list_name(id);
+        let Some(name) = self.ask_name(&tr("Đổi tên danh sách", "Rename list"), &old, &tr("Đổi tên", "Rename")) else { return };
+        if let Err(e) = self.store.rename_list(id, &name) {
+            return self.set_status(e);
+        }
+        self.reload_lists();
+        self.highlight_nav();
+        self.request_render();
+    }
+
+    pub fn delete_list(&self, id: i64) {
+        let name = self.list_name(id);
+        let alert = NSAlert::new(self.mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&ns(&tr(&format!("Xoá danh sách \"{name}\"?"), &format!("Delete the list \"{name}\"?"))));
+        alert.setInformativeText(&ns(&tr("Chỉ xoá danh sách, các tệp vẫn còn nguyên.", "Only the list is removed; the files are not touched.")));
+        let ok = alert.addButtonWithTitle(&ns(&tr("Xoá danh sách", "Delete list")));
+        ok.setHasDestructiveAction(true);
+        alert.addButtonWithTitle(&ns(&tr("Huỷ", "Cancel")));
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return;
+        }
+        if let Err(e) = self.store.delete_list(id) {
+            return self.set_status(e);
+        }
+        self.reload_lists();
+        if self.page.get() == Page::List(id) {
+            self.navigate(Page::Files);
+        }
+    }
+
+    /// Drop scan results and bookmarks whose file no longer exists (checked off the main thread).
+    pub fn prune_missing(&self) {
+        if self.pruning.replace(true) {
+            return;
+        }
+        let cands = self.candidates.borrow().clone();
+        let store = self.store.clone();
+        std::thread::spawn(move || {
+            let marks = store.all_bookmarks().unwrap_or_default();
+            let gone_c: Vec<String> = cands.iter().filter(|c| !still_exists(c)).map(|c| c.id.clone()).collect();
+            let gone_b: Vec<String> = marks.iter().filter(|c| !still_exists(c)).map(|c| c.id.clone()).collect();
+            let err = store.remove_candidates(&gone_c).and_then(|_| store.remove_bookmarks_for_files(&gone_b)).err();
+            later(move |a| {
+                a.pruning.set(false);
+                if let Some(e) = err {
+                    return a.set_status(e);
+                }
+                if gone_c.is_empty() && gone_b.is_empty() {
+                    return;
+                }
+                debug(&format!("pruned {} results, {} bookmarks", gone_c.len(), gone_b.len()));
+                a.candidates.borrow_mut().retain(|c| !gone_c.contains(&c.id));
+                a.list_items.borrow_mut().retain(|c| !gone_b.contains(&c.id));
+                a.selected.borrow_mut().retain(|id| !gone_c.contains(id) && !gone_b.contains(id));
+                a.reload_lists();
+                a.request_render();
+            });
+        });
     }
 
     // ------------------------------------------------------------ settings
@@ -815,6 +1098,10 @@ impl App {
                 Page::Files => item.metric.setStringValue(&ns(&active.to_string())),
                 Page::Ignored => item.metric.setStringValue(&ns(&if ignored > 0 { ignored.to_string() } else { String::new() })),
                 Page::Volumes => item.metric.setStringValue(&ns(&free)),
+                Page::List(id) => {
+                    let n = self.lists.borrow().iter().find(|l| l.id == id).map(|l| l.count).unwrap_or(0);
+                    item.metric.setStringValue(&ns(&if n > 0 { n.to_string() } else { String::new() }));
+                }
                 _ => {}
             }
         }
@@ -834,9 +1121,12 @@ impl App {
 
     pub fn update_footer(&self) {
         if let Some(l) = self.footer_status.borrow().as_ref() {
-            let on = self.settings.borrow().auto_scan;
+            let (on, every) = {
+                let s = self.settings.borrow();
+                (s.auto_scan, interval_text(s.scan_interval_minutes))
+            };
             l.setStringValue(&ns(&if on {
-                tr("Tự quét mỗi 2 giờ · bật", "Auto-scan every 2h · on")
+                tr(&format!("Tự quét mỗi {every} · bật"), &format!("Auto-scan every {every} · on"))
             } else {
                 tr("Tự quét · tắt", "Auto-scan · off")
             }));
@@ -864,5 +1154,14 @@ pub fn level_text(l: Level) -> String {
         Level::Green => tr("Dư dả", "Healthy"),
         Level::Yellow => tr("Sắp đầy", "Low"),
         Level::Red => tr("Gần hết", "Critical"),
+    }
+}
+
+/// "10 min", "2 h" style interval label.
+pub fn interval_text(minutes: i64) -> String {
+    if minutes >= 60 && minutes % 60 == 0 {
+        tr(&format!("{} giờ", minutes / 60), &format!("{} h", minutes / 60))
+    } else {
+        tr(&format!("{minutes} phút"), &format!("{minutes} min"))
     }
 }

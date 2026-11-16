@@ -24,6 +24,12 @@ fn default_time() -> DateTime<Utc> {
     zero_time()
 }
 
+pub const DEFAULT_SCAN_INTERVAL_MINUTES: i64 = 10;
+
+fn default_interval() -> i64 {
+    DEFAULT_SCAN_INTERVAL_MINUTES
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -38,6 +44,9 @@ pub struct Settings {
     /// Opt-in: sends paths, sizes and dates to the local `claude` CLI. Off unless the user turns it on.
     #[serde(default)]
     pub ai_review: bool,
+    /// Minutes between automatic scans.
+    #[serde(default = "default_interval")]
+    pub scan_interval_minutes: i64,
     #[serde(default, deserialize_with = "null_vec")]
     pub roots: Vec<String>,
     #[serde(default, deserialize_with = "null_vec")]
@@ -64,6 +73,7 @@ impl Settings {
             open_at_login: true,
             scan_home: false,
             ai_review: false,
+            scan_interval_minutes: DEFAULT_SCAN_INTERVAL_MINUTES,
             roots: vec![home.join("Downloads").to_string_lossy().into_owned()],
             exclusions: vec![],
             min_size_bytes: 500 * MB,
@@ -77,6 +87,9 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.scan_interval_minutes < 1 {
+            return Err("scan interval must be at least one minute".into());
+        }
         if self.min_size_bytes < 1 || self.min_age_days < 1 || self.red_gb < 1 || self.yellow_gb <= self.red_gb {
             return Err("invalid size, age, or disk thresholds".into());
         }
@@ -274,4 +287,39 @@ pub fn should_notify(before: &[Candidate], after: &[Candidate], before_level: Le
         return true;
     }
     after.iter().any(|c| !c.ignored && !before.iter().any(|b| b.id == c.id))
+}
+
+/// True when the file a candidate refers to is still on disk (same device and inode).
+pub fn still_exists(c: &Candidate) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(&c.path) {
+        Ok(md) => md.is_file() && md.dev() == c.device && md.ino() == c.inode,
+        Err(_) => false,
+    }
+}
+
+/// Copy the previous AI verdict onto candidates whose file is unchanged since
+/// the last scan; returns the indices of candidates that still need a review.
+/// A previous entry whose reason equals the fresh scan reason was never
+/// reviewed (or its review failed), so it is reviewed again.
+pub fn carry_over(before: &[Candidate], after: &mut [Candidate]) -> Vec<usize> {
+    let prev: std::collections::HashMap<&str, &Candidate> = before.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut todo = vec![];
+    for (i, c) in after.iter_mut().enumerate() {
+        match prev.get(c.id.as_str()) {
+            Some(b)
+                if b.path == c.path
+                    && b.size == c.size
+                    && b.modified_at == c.modified_at
+                    && b.last_used_at == c.last_used_at
+                    && b.last_use_known == c.last_use_known
+                    && b.reason != c.reason =>
+            {
+                c.safety = b.safety;
+                c.reason = b.reason.clone();
+            }
+            _ => todo.push(i),
+        }
+    }
+    todo
 }

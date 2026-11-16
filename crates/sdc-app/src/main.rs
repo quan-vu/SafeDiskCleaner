@@ -3,6 +3,7 @@
 
 mod app;
 mod pages;
+mod scan_sheet;
 mod system;
 mod ui;
 
@@ -47,7 +48,7 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _n: &NSNotification) {
-            app().cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            app().cancel.borrow().store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -206,7 +207,7 @@ fn main() {
         return;
     }
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(mtm), init] };
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     let _: Option<&AnyObject> = None;
